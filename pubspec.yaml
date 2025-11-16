@@ -38,6 +38,9 @@ dependencies:
   flutter_secure_storage: ^9.2.2
   image_picker: ^1.1.2
   qr_flutter: ^4.1.0
+  video_player: ^2.9.2
+  just_audio: ^0.9.40
+  firebase_core: ^4.2.0
 
 dev_dependencies:
   flutter_test:

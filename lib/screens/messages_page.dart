@@ -5,10 +5,13 @@ import 'package:messenger_flutter/api/chats_service.dart';
 import 'package:messenger_flutter/api/messages_service.dart';
 import 'package:messenger_flutter/api/media_service.dart';
 import 'package:messenger_flutter/api/accounts_service.dart';
+import 'package:messenger_flutter/api/unread_service.dart';
 import 'package:messenger_flutter/models/chat_models.dart';
 import 'package:messenger_flutter/config.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
+import 'package:messenger_flutter/widgets/media_bubbles.dart';
+import 'dart:async';
 
 class MessagesPage extends StatefulWidget {
   final ApiClient client;
@@ -32,6 +35,7 @@ class _MessagesPageState extends State<MessagesPage> {
   late final MessagesService _messages;
   late final MediaService _media;
   late final OrganizationPhonesService _phones;
+  late final UnreadService _unread;
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _jidCtrl = TextEditingController();
@@ -41,6 +45,7 @@ class _MessagesPageState extends State<MessagesPage> {
   List<dynamic> _orgPhones = [];
   int? _selectedPhoneId;
   final Map<String, ImageProvider> _imageCache = {};
+  Timer? _poller;
 
   @override
   void initState() {
@@ -49,8 +54,10 @@ class _MessagesPageState extends State<MessagesPage> {
     _messages = MessagesService(widget.client);
     _media = MediaService(widget.client);
     _phones = OrganizationPhonesService(widget.client);
+    _unread = UnreadService(widget.client);
     _load();
     _loadPhones();
+    _startPolling();
     // Автоподстановка из чата
     if (widget.initialReceiverJid != null &&
         widget.initialReceiverJid!.isNotEmpty) {
@@ -63,6 +70,7 @@ class _MessagesPageState extends State<MessagesPage> {
 
   @override
   void dispose() {
+    _poller?.cancel();
     _textCtrl.dispose();
     _scrollCtrl.dispose();
     _jidCtrl.dispose();
@@ -78,23 +86,63 @@ class _MessagesPageState extends State<MessagesPage> {
     return '$base/$url';
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  Future<void> _load({bool showLoading = true}) async {
+    // Сохраняем текущую позицию скролла ДО любых изменений state
+    final currentOffset = _scrollCtrl.hasClients ? _scrollCtrl.offset : 0.0;
+    final isAtBottom = _scrollCtrl.hasClients
+        ? _scrollCtrl.offset <=
+              10.0 // небольшой порог для "внизу"
+        : true;
+    final oldLength = _items.length;
+
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
+
     try {
       final res = await _chats.chatMessages(widget.chatId);
-      setState(() => _items = res.messages);
-      await Future.delayed(const Duration(milliseconds: 50));
-      if (_scrollCtrl.hasClients) {
-        _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
-      }
+
+      setState(() {
+        _items = res.messages.reversed.toList();
+        if (showLoading) _loading = false;
+      });
+
+      // Восстанавливаем позицию ПОСЛЕ завершения рендеринга
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollCtrl.hasClients) return;
+
+        // Если были внизу или это первая загрузка - остаёмся внизу
+        if (isAtBottom || oldLength == 0) {
+          _scrollCtrl.jumpTo(0.0);
+        } else {
+          // Иначе восстанавливаем сохранённую позицию
+          final maxScroll = _scrollCtrl.position.maxScrollExtent;
+          final targetOffset = currentOffset > maxScroll
+              ? maxScroll
+              : currentOffset;
+          _scrollCtrl.jumpTo(targetOffset);
+        }
+      });
     } catch (e) {
-      setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
+      setState(() {
+        _error = '$e';
+        if (showLoading) _loading = false;
+      });
     }
+  }
+
+  void _startPolling() {
+    _poller?.cancel();
+    _poller = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!mounted) return;
+      if (_loading) return;
+      try {
+        await _load(showLoading: false); // при polling не показываем индикатор
+      } catch (_) {}
+    });
   }
 
   Future<void> _loadPhones() async {
@@ -165,10 +213,68 @@ class _MessagesPageState extends State<MessagesPage> {
     }
   }
 
+  Future<void> _markAsRead() async {
+    try {
+      final result = await _unread.markChatRead(widget.chatId);
+      final markedCount = result['markedCount'] ?? 0;
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.white),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text('Отмечено как прочитано: $markedCount сообщений'),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.green.shade600,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error_outline, color: Colors.white),
+                const SizedBox(width: 12),
+                Expanded(child: Text('Ошибка: $e')),
+              ],
+            ),
+            backgroundColor: Colors.red.shade600,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('Чат #${widget.chatId}')),
+      appBar: AppBar(
+        title: Text('Чат #${widget.chatId}'),
+        actions: [
+          IconButton(
+            onPressed: _markAsRead,
+            icon: const Icon(Icons.done_all),
+            tooltip: 'Отметить как прочитанное',
+            color: Colors.green.shade600,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           // Панель выбора телефона и JID для отправки текста
@@ -191,20 +297,35 @@ class _MessagesPageState extends State<MessagesPage> {
                         .where((e) => e.value != null)
                         .cast<DropdownMenuItem<int>>()
                         .toList(),
-                    onChanged: (v) => setState(() => _selectedPhoneId = v),
+                    onChanged: null, // Отключаем редактирование
                     decoration: const InputDecoration(
                       labelText: 'Номер (orgPhoneId)',
                     ),
+                    disabledHint: _selectedPhoneId != null
+                        ? Text(
+                            _orgPhones.firstWhere(
+                                  (e) => e['id'] == _selectedPhoneId,
+                                  orElse: () => {
+                                    'displayName': 'phone',
+                                    'id': _selectedPhoneId,
+                                  },
+                                )['displayName'] ??
+                                'phone (#$_selectedPhoneId)',
+                            style: const TextStyle(color: Colors.black87),
+                          )
+                        : null,
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
                     controller: _jidCtrl,
+                    readOnly: true, // Отключаем редактирование
                     decoration: const InputDecoration(
                       labelText: 'receiverJid',
                       hintText: '7900...@s.whatsapp.net',
                     ),
+                    style: const TextStyle(color: Colors.black87),
                   ),
                 ),
               ],
@@ -215,62 +336,129 @@ class _MessagesPageState extends State<MessagesPage> {
                 ? const Center(child: CircularProgressIndicator())
                 : ListView.builder(
                     controller: _scrollCtrl,
+                    reverse: true,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
                     itemCount: _items.length,
                     itemBuilder: (_, i) {
                       final m = _items[i];
                       final isMine =
                           m.senderUserId !=
                           null; // упрощение: если есть senderUserId, считаем исходящим
-                      return Align(
-                        alignment: isMine
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
-                        child: Container(
-                          margin: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 4,
-                          ),
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                            color: isMine
-                                ? Colors.teal.shade100
-                                : Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              if (m.senderJid != null || isMine)
-                                Padding(
-                                  padding: const EdgeInsets.only(bottom: 2.0),
-                                  child: Text(
-                                    m.senderJid ?? 'Вы',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.black87,
-                                    ),
-                                  ),
-                                ),
-                              if (m.mediaUrl != null && m.mediaUrl!.isNotEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.only(bottom: 6.0),
-                                  child: _buildMediaWidget(m),
-                                ),
-                              Text(m.content.isEmpty ? '...' : m.content),
-                              const SizedBox(height: 4),
-                              Text(
-                                m.timestamp.toLocal().toString().substring(
-                                  0,
-                                  19,
-                                ),
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.black54,
-                                ),
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Row(
+                          mainAxisAlignment: isMine
+                              ? MainAxisAlignment.end
+                              : MainAxisAlignment.start,
+                          children: [
+                            Container(
+                              constraints: BoxConstraints(
+                                maxWidth:
+                                    MediaQuery.of(context).size.width * 0.65,
                               ),
-                            ],
-                          ),
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: isMine
+                                    ? Theme.of(
+                                        context,
+                                      ).colorScheme.primaryContainer
+                                    : Theme.of(
+                                        context,
+                                      ).colorScheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.only(
+                                  topLeft: const Radius.circular(16),
+                                  topRight: const Radius.circular(16),
+                                  bottomLeft: isMine
+                                      ? const Radius.circular(16)
+                                      : const Radius.circular(4),
+                                  bottomRight: isMine
+                                      ? const Radius.circular(4)
+                                      : const Radius.circular(16),
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.05),
+                                    offset: const Offset(0, 1),
+                                    blurRadius: 3,
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  if (m.senderJid != null || isMine)
+                                    Padding(
+                                      padding: const EdgeInsets.only(
+                                        bottom: 6.0,
+                                      ),
+                                      child: Text(
+                                        m.senderJid ?? 'Вы',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: isMine
+                                              ? Theme.of(
+                                                  context,
+                                                ).colorScheme.onPrimaryContainer
+                                              : Theme.of(
+                                                  context,
+                                                ).colorScheme.primary,
+                                        ),
+                                      ),
+                                    ),
+                                  if (m.mediaUrl != null &&
+                                      m.mediaUrl!.isNotEmpty)
+                                    Padding(
+                                      padding: const EdgeInsets.only(
+                                        bottom: 8.0,
+                                      ),
+                                      child: _buildMediaWidget(m),
+                                    ),
+                                  if (m.content.isNotEmpty)
+                                    Text(
+                                      m.content,
+                                      style: TextStyle(
+                                        fontSize: 15,
+                                        color: isMine
+                                            ? Theme.of(
+                                                context,
+                                              ).colorScheme.onPrimaryContainer
+                                            : Theme.of(
+                                                context,
+                                              ).colorScheme.onSurface,
+                                      ),
+                                    ),
+                                  const SizedBox(height: 4),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        m.timestamp
+                                            .toLocal()
+                                            .toString()
+                                            .substring(11, 16),
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color:
+                                              (isMine
+                                                      ? Theme.of(context)
+                                                            .colorScheme
+                                                            .onPrimaryContainer
+                                                      : Theme.of(context)
+                                                            .colorScheme
+                                                            .onSurfaceVariant)
+                                                  .withValues(alpha: 0.7),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -281,24 +469,72 @@ class _MessagesPageState extends State<MessagesPage> {
               padding: const EdgeInsets.all(8.0),
               child: Text(_error!, style: const TextStyle(color: Colors.red)),
             ),
-          Padding(
+          Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surface,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.05),
+                  offset: const Offset(0, -1),
+                  blurRadius: 4,
+                ),
+              ],
+            ),
             padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
             child: Row(
               children: [
-                IconButton(
-                  onPressed: _loading ? null : _sendImage,
-                  icon: const Icon(Icons.image_outlined),
-                ),
-                Expanded(
-                  child: TextField(
-                    controller: _textCtrl,
-                    decoration: const InputDecoration(hintText: 'Сообщение...'),
-                    onSubmitted: (_) => _sendText(),
+                Container(
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primaryContainer,
+                    shape: BoxShape.circle,
+                  ),
+                  child: IconButton(
+                    onPressed: _loading ? null : _sendImage,
+                    icon: Icon(
+                      Icons.image_outlined,
+                      color: Theme.of(context).colorScheme.onPrimaryContainer,
+                    ),
+                    tooltip: 'Отправить изображение',
                   ),
                 ),
-                IconButton(
-                  onPressed: _loading ? null : _sendText,
-                  icon: const Icon(Icons.send),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    child: TextField(
+                      controller: _textCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'Сообщение...',
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                      ),
+                      onSubmitted: (_) => _sendText(),
+                      maxLines: null,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primary,
+                    shape: BoxShape.circle,
+                  ),
+                  child: IconButton(
+                    onPressed: _loading ? null : _sendText,
+                    icon: Icon(
+                      Icons.send,
+                      color: Theme.of(context).colorScheme.onPrimary,
+                    ),
+                    tooltip: 'Отправить',
+                  ),
                 ),
               ],
             ),
@@ -341,6 +577,12 @@ class _MessagesPageState extends State<MessagesPage> {
                 ),
         ),
       );
+    }
+    if (m.type == 'video') {
+      return VideoBubble(client: widget.client, url: url);
+    }
+    if (m.type == 'audio') {
+      return AudioBubble(client: widget.client, url: url);
     }
     return _mediaFallback(url, m.type);
   }

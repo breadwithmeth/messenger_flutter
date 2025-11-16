@@ -17,6 +17,21 @@ class OrganizationPhoneDto {
       );
 }
 
+class AssignedUserDto {
+  final int id;
+  final String? name;
+  final String? email;
+
+  AssignedUserDto({required this.id, this.name, this.email});
+
+  factory AssignedUserDto.fromJson(Map<String, dynamic> json) =>
+      AssignedUserDto(
+        id: json['id'] as int,
+        name: json['name'] as String?,
+        email: json['email'] as String?,
+      );
+}
+
 class ChatDto {
   final int id;
   final String? name;
@@ -31,6 +46,7 @@ class ChatDto {
   final int unreadCount;
   final DateTime? lastMessageAt;
   final int? assignedUserId;
+  final AssignedUserDto? assignedUser;
 
   ChatDto({
     required this.id,
@@ -46,6 +62,7 @@ class ChatDto {
     required this.unreadCount,
     this.lastMessageAt,
     this.assignedUserId,
+    this.assignedUser,
   });
 
   factory ChatDto.fromJson(Map<String, dynamic> json) => ChatDto(
@@ -70,6 +87,9 @@ class ChatDto {
         ? DateTime.tryParse(json['lastMessageAt'] as String)
         : null,
     assignedUserId: json['assignedUserId'] as int?,
+    assignedUser: json['assignedUser'] != null
+        ? AssignedUserDto.fromJson(json['assignedUser'] as Map<String, dynamic>)
+        : null,
   );
 }
 
