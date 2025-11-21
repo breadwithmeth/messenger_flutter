@@ -606,10 +606,10 @@ extension on _PhonesPageState {
                   width: double.infinity,
                   child: FilledButton(
                     onPressed: () => Navigator.of(ctx).pop(),
-                    child: const Text('Готово'),
                     style: FilledButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 14),
                     ),
+                    child: const Text('Готово'),
                   ),
                 ),
               ],

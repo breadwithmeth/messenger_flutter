@@ -39,4 +39,16 @@ class MessagesService {
     final res = await _client.postJson('/api/messages/send-media', data: data);
     return res.data as Map<String, dynamic>;
   }
+
+  /// Отправить текстовое сообщение по номеру тикета
+  Future<Map<String, dynamic>> sendByTicket({
+    required int ticketNumber,
+    required String text,
+  }) async {
+    final res = await _client.postJson(
+      '/api/messages/send-by-ticket',
+      data: {'ticketNumber': ticketNumber, 'text': text},
+    );
+    return res.data as Map<String, dynamic>;
+  }
 }

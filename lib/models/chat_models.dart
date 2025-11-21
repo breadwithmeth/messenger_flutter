@@ -135,6 +135,8 @@ class MessageDto {
   final int? senderUserId; // null = входящее (клиент)
   final DateTime timestamp;
   final bool isRead;
+  final bool fromMe; // true если от оператора
+  final SenderUserDto? senderUser; // информация об операторе
 
   MessageDto({
     required this.id,
@@ -146,12 +148,14 @@ class MessageDto {
     this.senderUserId,
     required this.timestamp,
     required this.isRead,
+    required this.fromMe,
+    this.senderUser,
   });
 
   factory MessageDto.fromJson(Map<String, dynamic> json) => MessageDto(
     id: json['id'] as int,
     chatId: json['chatId'] as int,
-    type: json['type'] as String,
+    type: json['type'] as String? ?? json['messageType'] as String? ?? 'text',
     content:
         (json['text'] ?? json['content'] ?? json['caption'] ?? '') as String,
     mediaUrl: json['mediaUrl'] as String?,
@@ -159,6 +163,24 @@ class MessageDto {
     senderUserId: json['senderUserId'] as int?,
     timestamp: DateTime.parse(json['timestamp'] as String),
     isRead: json['isRead'] as bool? ?? false,
+    fromMe: json['fromMe'] as bool? ?? (json['senderUserId'] != null),
+    senderUser: json['senderUser'] != null
+        ? SenderUserDto.fromJson(json['senderUser'] as Map<String, dynamic>)
+        : null,
+  );
+}
+
+class SenderUserDto {
+  final int id;
+  final String? name;
+  final String? email;
+
+  SenderUserDto({required this.id, this.name, this.email});
+
+  factory SenderUserDto.fromJson(Map<String, dynamic> json) => SenderUserDto(
+    id: json['id'] as int,
+    name: json['name'] as String?,
+    email: json['email'] as String?,
   );
 }
 
