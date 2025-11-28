@@ -17,8 +17,9 @@ class ApiClient {
     : _dio = dio ?? Dio(),
       _storage = storage ?? const FlutterSecureStorage() {
     _dio.options.baseUrl = baseUrl;
-    _dio.options.connectTimeout = const Duration(seconds: 20);
-    _dio.options.receiveTimeout = const Duration(seconds: 30);
+    _dio.options.connectTimeout = const Duration(seconds: 60);
+    _dio.options.receiveTimeout = const Duration(seconds: 90);
+    _dio.options.sendTimeout = const Duration(seconds: 60);
 
     // Interceptor: добавляет Authorization заголовок если токен есть
     _dio.interceptors.add(
@@ -59,6 +60,14 @@ class ApiClient {
 
   Future<Response<T>> postForm<T>(String path, FormData formData) {
     return _dio.post<T>(path, data: formData);
+  }
+
+  Future<Response<T>> patch<T>(
+    String path, {
+    Object? data,
+    Map<String, dynamic>? query,
+  }) {
+    return _dio.patch<T>(path, data: data, queryParameters: query);
   }
 
   Future<Response<T>> delete<T>(

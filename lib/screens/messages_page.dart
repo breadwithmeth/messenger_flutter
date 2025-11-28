@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:messenger_flutter/api/api_client.dart';
 import 'package:messenger_flutter/api/chats_service.dart';
@@ -6,11 +7,16 @@ import 'package:messenger_flutter/api/messages_service.dart';
 import 'package:messenger_flutter/api/media_service.dart';
 import 'package:messenger_flutter/api/accounts_service.dart';
 import 'package:messenger_flutter/api/unread_service.dart';
+import 'package:messenger_flutter/api/telegram_bots_service.dart';
+import 'package:messenger_flutter/api/auth_service.dart';
+import 'package:messenger_flutter/models/auth_models.dart';
 import 'package:messenger_flutter/models/chat_models.dart';
 import 'package:messenger_flutter/config.dart';
+import 'package:messenger_flutter/api/ollama_service.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:messenger_flutter/widgets/media_bubbles.dart';
+import 'package:super_clipboard/super_clipboard.dart';
 import 'dart:async';
 
 class MessagesPage extends StatefulWidget {
@@ -18,12 +24,15 @@ class MessagesPage extends StatefulWidget {
   final int chatId;
   final String? initialReceiverJid;
   final int? initialOrganizationPhoneId;
+  final ChatDto? chat; // Добавляем возможность передать объект чата
+
   const MessagesPage({
     super.key,
     required this.client,
     required this.chatId,
     this.initialReceiverJid,
     this.initialOrganizationPhoneId,
+    this.chat, // Опциональный параметр
   });
 
   @override
@@ -36,7 +45,10 @@ class _MessagesPageState extends State<MessagesPage> {
   late final MediaService _media;
   late final OrganizationPhonesService _phones;
   late final UnreadService _unread;
+  late final TelegramBotsService _telegramBots;
+  late final AuthService _auth;
   final _textCtrl = TextEditingController();
+  UserDto? _me;
   final _scrollCtrl = ScrollController();
   final _jidCtrl = TextEditingController();
   List<MessageDto> _items = [];
@@ -46,6 +58,10 @@ class _MessagesPageState extends State<MessagesPage> {
   int? _selectedPhoneId;
   final Map<String, ImageProvider> _imageCache = {};
   Timer? _poller;
+  List<dynamic> _operators = [];
+  ChatDto? _currentChat; // Информация о текущем чате
+  final _ollamaService = OllamaService();
+  bool _isImprovingText = false;
 
   @override
   void initState() {
@@ -55,8 +71,21 @@ class _MessagesPageState extends State<MessagesPage> {
     _media = MediaService(widget.client);
     _phones = OrganizationPhonesService(widget.client);
     _unread = UnreadService(widget.client);
+    _telegramBots = TelegramBotsService(widget.client);
+    _auth = AuthService(widget.client);
+    _loadCurrentUser();
+
+    // Если чат передан напрямую, используем его
+    if (widget.chat != null) {
+      _currentChat = widget.chat;
+      print('DEBUG: Chat provided directly: ${_currentChat?.channel}');
+    } else {
+      _loadChatInfo();
+    }
+
     _load();
     _loadPhones();
+    _loadOperators();
     _startPolling();
     // Автоподстановка из чата
     if (widget.initialReceiverJid != null &&
@@ -103,6 +132,15 @@ class _MessagesPageState extends State<MessagesPage> {
     }
 
     try {
+      // Если chatId = 0, это новый чат - не загружаем сообщения
+      if (widget.chatId == 0) {
+        setState(() {
+          _items = [];
+          if (showLoading) _loading = false;
+        });
+        return;
+      }
+
       final res = await _chats.chatMessages(widget.chatId);
 
       setState(() {
@@ -136,7 +174,7 @@ class _MessagesPageState extends State<MessagesPage> {
 
   void _startPolling() {
     _poller?.cancel();
-    _poller = Timer.periodic(const Duration(seconds: 5), (_) async {
+    _poller = Timer.periodic(const Duration(seconds: 15), (_) async {
       if (!mounted) return;
       if (_loading) return;
       try {
@@ -159,27 +197,321 @@ class _MessagesPageState extends State<MessagesPage> {
     }
   }
 
+  Future<void> _loadOperators() async {
+    try {
+      final list = await _chats.getOperators();
+      setState(() {
+        _operators = list;
+      });
+    } catch (e) {
+      // игнорируем мягко
+    }
+  }
+
+  Future<void> _loadCurrentUser() async {
+    try {
+      final user = await _auth.me();
+      setState(() {
+        _me = user;
+      });
+    } catch (e) {
+      // игнорируем мягко
+    }
+  }
+
+  Future<void> _loadChatInfo() async {
+    if (widget.chatId == 0) return; // Новый чат
+
+    try {
+      print('DEBUG: Loading chat info for chatId: ${widget.chatId}');
+      // Загружаем информацию о чате из списка чатов
+      final chatsResponse = await _chats.listChats();
+      print('DEBUG: Got ${chatsResponse.chats.length} chats from API');
+
+      final chat = chatsResponse.chats.firstWhere(
+        (c) => c.id == widget.chatId,
+        orElse: () => throw Exception('Chat not found'),
+      );
+
+      print(
+        'DEBUG: Found chat: id=${chat.id}, channel=${chat.channel}, isTelegram=${chat.isTelegram}',
+      );
+      print(
+        'DEBUG: Telegram bot: ${chat.telegramBot?.id}, chatId: ${chat.telegramChatId}',
+      );
+
+      setState(() {
+        _currentChat = chat;
+      });
+    } catch (e) {
+      // Игнорируем ошибки, будем использовать WhatsApp по умолчанию
+      print('Error loading chat info: $e');
+    }
+  }
+
+  Future<void> _assignChatToMe() async {
+    if (widget.chatId == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Нельзя назначить новый чат. Сначала отправьте сообщение.',
+          ),
+          backgroundColor: CupertinoColors.destructiveRed,
+        ),
+      );
+      return;
+    }
+
+    if (_me == null) {
+      await _loadCurrentUser();
+    }
+
+    if (_me == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Не удалось определить текущего пользователя'),
+            backgroundColor: CupertinoColors.destructiveRed,
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      await _chats.assignChat(widget.chatId, _me!.id);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Чат назначен вам (${_me!.email})'),
+            backgroundColor: CupertinoColors.systemGreen,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка назначения: $e'),
+            backgroundColor: CupertinoColors.destructiveRed,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _assignChatToOperator() async {
+    if (widget.chatId == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Нельзя назначить новый чат. Сначала отправьте сообщение.',
+          ),
+          backgroundColor: CupertinoColors.destructiveRed,
+        ),
+      );
+      return;
+    }
+
+    if (_operators.isEmpty) {
+      await _loadOperators();
+    }
+
+    if (!mounted) return;
+
+    showCupertinoDialog(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('Назначить чат оператору'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 12),
+            ..._operators.map((op) {
+              final name = op['name'] ?? op['email'] ?? 'ID: ${op['id']}';
+              return CupertinoDialogAction(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  try {
+                    await _chats.assignChat(widget.chatId, op['id'] as int);
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Чат назначен оператору: $name'),
+                          backgroundColor: CupertinoColors.systemGreen,
+                        ),
+                      );
+                    }
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Ошибка назначения: $e'),
+                          backgroundColor: CupertinoColors.destructiveRed,
+                        ),
+                      );
+                    }
+                  }
+                },
+                child: Text(name),
+              );
+            }).toList(),
+          ],
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Удаляет теги <think>...</think> из текста
+  String _removeThinkTags(String text) {
+    // Удаляем все вхождения <think>...</think> (включая многострочные)
+    return text
+        .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
+        .trim();
+  }
+
+  Future<void> _improveText() async {
+    final text = _textCtrl.text.trim();
+    if (text.isEmpty) return;
+
+    // Проверяем, включена ли Ollama
+    final isEnabled = await AppConfig.isOllamaEnabled();
+    if (!isEnabled) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (context) => CupertinoAlertDialog(
+          title: const Text('Ollama не настроена'),
+          content: const Text(
+            'Для улучшения текста необходимо настроить Ollama в настройках приложения.',
+          ),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('OK'),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isImprovingText = true);
+    try {
+      final prompt =
+          '''Перепиши текст вежливо и профессионально. Поменяй местами предложения, улучши стиль и грамматику, сохрани смысл.
+
+Текст: $text
+
+''';
+
+      final improvedText = await _ollamaService.generate(prompt: prompt);
+
+      if (!mounted) return;
+
+      if (improvedText != null && improvedText.trim().isNotEmpty) {
+        // Удаляем теги <think> из ответа
+        final cleanedText = _removeThinkTags(improvedText);
+
+        setState(() {
+          _textCtrl.text = cleanedText;
+        });
+
+        // Показываем уведомление об успехе
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Текст улучшен!'),
+            backgroundColor: CupertinoColors.systemGreen.resolveFrom(context),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      } else {
+        throw Exception('Не удалось получить улучшенный текст');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder: (context) => CupertinoAlertDialog(
+          title: const Text('Ошибка'),
+          content: Text(
+            'Не удалось улучшить текст: $e\n\nПроверьте настройки Ollama и убедитесь, что сервер запущен.',
+          ),
+          actions: [
+            CupertinoDialogAction(
+              child: const Text('OK'),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isImprovingText = false);
+      }
+    }
+  }
+
   Future<void> _sendText() async {
     final text = _textCtrl.text.trim();
     if (text.isEmpty) return;
-    if (_selectedPhoneId == null) {
-      setState(() => _error = 'Выберите номер (organizationPhoneId)');
-      return;
-    }
-    if (_jidCtrl.text.trim().isEmpty) {
-      setState(() => _error = 'Укажите receiverJid');
-      return;
-    }
+
     setState(() => _loading = true);
     try {
-      await _messages.sendText(
-        organizationPhoneId: _selectedPhoneId!,
-        receiverJid: _jidCtrl.text.trim(),
-        text: text,
-      );
+      // Проверяем тип чата
+      print('DEBUG: Sending message, _currentChat: ${_currentChat?.channel}');
+      print('DEBUG: isTelegram: ${_currentChat?.isTelegram}');
+
+      if (_currentChat?.isTelegram == true) {
+        // Отправка через Telegram API
+        final botId = _currentChat!.telegramBot?.id;
+        final telegramChatId = _currentChat!.telegramChatId;
+
+        print('DEBUG: Telegram botId: $botId, chatId: $telegramChatId');
+
+        if (botId == null || telegramChatId == null) {
+          setState(() => _error = 'Telegram bot or chat ID not found');
+          return;
+        }
+
+        print('DEBUG: Sending Telegram message: $text');
+        await _telegramBots.sendMessage(
+          botId: botId,
+          chatId: telegramChatId,
+          content: text,
+        );
+        print('DEBUG: Telegram message sent successfully');
+      } else {
+        // Отправка через WhatsApp API
+        print('DEBUG: Sending WhatsApp message');
+        if (_selectedPhoneId == null) {
+          setState(() => _error = 'Выберите номер (organizationPhoneId)');
+          return;
+        }
+        if (_jidCtrl.text.trim().isEmpty) {
+          setState(() => _error = 'Укажите receiverJid');
+          return;
+        }
+
+        await _messages.sendText(
+          organizationPhoneId: _selectedPhoneId!,
+          receiverJid: _jidCtrl.text.trim(),
+          text: text,
+        );
+      }
+
       _textCtrl.clear();
       await _load();
     } catch (e) {
+      print('DEBUG: Error sending message: $e');
       setState(() => _error = '$e');
     } finally {
       setState(() => _loading = false);
@@ -210,6 +542,199 @@ class _MessagesPageState extends State<MessagesPage> {
       setState(() => _error = '$e');
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _pasteFromClipboard() async {
+    try {
+      final clipboard = SystemClipboard.instance;
+      if (clipboard == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Буфер обмена недоступен на этой платформе'),
+            ),
+          );
+        }
+        return;
+      }
+
+      final reader = await clipboard.read();
+
+      // Проверяем каждый элемент в буфере обмена
+      for (var item in reader.items) {
+        // Пробуем получить изображение PNG
+        if (item.canProvide(Formats.png)) {
+          setState(() => _loading = true);
+          try {
+            item.getFile(Formats.png, (file) async {
+              try {
+                final stream = file.getStream();
+                final bytes = await stream.toList();
+                final imageBytes = Uint8List.fromList(
+                  bytes.expand((x) => x).toList(),
+                );
+                await _uploadAndSendImage(imageBytes, 'pasted_image.png');
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Ошибка при чтении изображения: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              } finally {
+                setState(() => _loading = false);
+              }
+            });
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Ошибка при отправке изображения: $e'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+            setState(() => _loading = false);
+          }
+          return;
+        }
+
+        // Пробуем получить изображение JPEG
+        if (item.canProvide(Formats.jpeg)) {
+          setState(() => _loading = true);
+          try {
+            item.getFile(Formats.jpeg, (file) async {
+              try {
+                final stream = file.getStream();
+                final bytes = await stream.toList();
+                final imageBytes = Uint8List.fromList(
+                  bytes.expand((x) => x).toList(),
+                );
+                await _uploadAndSendImage(imageBytes, 'pasted_image.jpg');
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Ошибка при чтении изображения: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              } finally {
+                setState(() => _loading = false);
+              }
+            });
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Ошибка при отправке изображения: $e'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+            setState(() => _loading = false);
+          }
+          return;
+        }
+
+        // Пробуем получить изображение GIF
+        if (item.canProvide(Formats.gif)) {
+          setState(() => _loading = true);
+          try {
+            item.getFile(Formats.gif, (file) async {
+              try {
+                final stream = file.getStream();
+                final bytes = await stream.toList();
+                final imageBytes = Uint8List.fromList(
+                  bytes.expand((x) => x).toList(),
+                );
+                await _uploadAndSendImage(imageBytes, 'pasted_image.gif');
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Ошибка при чтении изображения: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              } finally {
+                setState(() => _loading = false);
+              }
+            });
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Ошибка при отправке изображения: $e'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+            setState(() => _loading = false);
+          }
+          return;
+        }
+      }
+
+      // Если изображение не найдено, пробуем вставить текст
+      for (var item in reader.items) {
+        if (item.canProvide(Formats.plainText)) {
+          try {
+            final text = await item.readValue(Formats.plainText);
+            if (text != null) {
+              setState(() {
+                _textCtrl.text += text;
+              });
+            }
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Ошибка вставки текста: $e')),
+              );
+            }
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка доступа к буферу обмена: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _uploadAndSendImage(Uint8List bytes, String fileName) async {
+    final part = MultipartFile.fromBytes(bytes, filename: fileName);
+
+    final caption = _textCtrl.text.trim().isNotEmpty
+        ? _textCtrl.text.trim()
+        : null;
+
+    await _media.uploadAndSend(
+      mediaPart: part,
+      chatId: widget.chatId,
+      mediaType: 'image',
+      caption: caption,
+    );
+
+    if (caption != null) _textCtrl.clear();
+    await _load();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Изображение отправлено'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -264,73 +789,181 @@ class _MessagesPageState extends State<MessagesPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text('Чат #${widget.chatId}'),
-        actions: [
-          IconButton(
-            onPressed: _markAsRead,
-            icon: const Icon(Icons.done_all),
-            tooltip: 'Отметить как прочитанное',
-            color: Colors.green.shade600,
+      appBar: CupertinoNavigationBar(
+        backgroundColor: CupertinoColors.systemBackground.resolveFrom(context),
+        border: Border(
+          bottom: BorderSide(
+            color: CupertinoColors.separator.resolveFrom(context),
+            width: 0.5,
           ),
-        ],
+        ),
+        leading: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () => Navigator.pop(context),
+          child: const Icon(CupertinoIcons.back, size: 28),
+        ),
+        middle: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: CupertinoColors.systemGrey5.resolveFrom(context),
+              ),
+              child: Icon(
+                CupertinoIcons.person_fill,
+                color: CupertinoColors.systemGrey.resolveFrom(context),
+                size: 16,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_currentChat?.isTelegram == true) ...[
+                        Icon(
+                          CupertinoIcons.chat_bubble_text_fill,
+                          size: 14,
+                          color: CupertinoColors.activeBlue.resolveFrom(
+                            context,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                      ],
+                      Text(
+                        widget.chatId == 0
+                            ? 'Новый чат'
+                            : (_currentChat?.displayName ??
+                                  'Чат #${widget.chatId}'),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Text(
+                    _items.isEmpty
+                        ? 'Нет сообщений'
+                        : '${_items.length} сообщений',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: CupertinoColors.secondaryLabel.resolveFrom(
+                        context,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Tooltip(
+              message: 'Назначить мне',
+              child: CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed: _assignChatToMe,
+                child: Icon(
+                  CupertinoIcons.person_fill,
+                  color: CupertinoColors.systemGreen.resolveFrom(context),
+                  size: 28,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Tooltip(
+              message: 'Назначить оператору',
+              child: CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed: _assignChatToOperator,
+                child: Icon(
+                  CupertinoIcons.person_2_fill,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                  size: 28,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _markAsRead,
+              child: Icon(
+                CupertinoIcons.checkmark_alt_circle_fill,
+                color: CupertinoColors.systemGreen.resolveFrom(context),
+                size: 28,
+              ),
+            ),
+          ],
+        ),
       ),
       body: Column(
         children: [
-          // Панель выбора телефона и JID для отправки текста
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: DropdownButtonFormField<int>(
-                    value: _selectedPhoneId,
-                    items: _orgPhones
-                        .map(
-                          (e) => DropdownMenuItem<int>(
-                            value: e['id'] as int?,
-                            child: Text(
-                              '${e['displayName'] ?? 'phone'} (#${e['id'] ?? ''})',
+          // Панель выбора телефона и JID для отправки текста (только для WhatsApp)
+          if (_currentChat?.isWhatsApp !=
+              false) // Показываем для WhatsApp или если чат еще не загружен
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: DropdownButtonFormField<int>(
+                      value: _selectedPhoneId,
+                      items: _orgPhones
+                          .map(
+                            (e) => DropdownMenuItem<int>(
+                              value: e['id'] as int?,
+                              child: Text(
+                                '${e['displayName'] ?? 'phone'} (#${e['id'] ?? ''})',
+                              ),
                             ),
-                          ),
-                        )
-                        .where((e) => e.value != null)
-                        .cast<DropdownMenuItem<int>>()
-                        .toList(),
-                    onChanged: null, // Отключаем редактирование
-                    decoration: const InputDecoration(
-                      labelText: 'Номер (orgPhoneId)',
-                    ),
-                    disabledHint: _selectedPhoneId != null
-                        ? Text(
-                            _orgPhones.firstWhere(
-                                  (e) => e['id'] == _selectedPhoneId,
-                                  orElse: () => {
-                                    'displayName': 'phone',
-                                    'id': _selectedPhoneId,
-                                  },
-                                )['displayName'] ??
-                                'phone (#$_selectedPhoneId)',
-                            style: const TextStyle(color: Colors.black87),
                           )
-                        : null,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: TextField(
-                    controller: _jidCtrl,
-                    readOnly: true, // Отключаем редактирование
-                    decoration: const InputDecoration(
-                      labelText: 'receiverJid',
-                      hintText: '7900...@s.whatsapp.net',
+                          .where((e) => e.value != null)
+                          .cast<DropdownMenuItem<int>>()
+                          .toList(),
+                      onChanged: null, // Отключаем редактирование
+                      decoration: const InputDecoration(
+                        labelText: 'Номер (orgPhoneId)',
+                      ),
+                      disabledHint: _selectedPhoneId != null
+                          ? Text(
+                              _orgPhones.firstWhere(
+                                    (e) => e['id'] == _selectedPhoneId,
+                                    orElse: () => {
+                                      'displayName': 'phone',
+                                      'id': _selectedPhoneId,
+                                    },
+                                  )['displayName'] ??
+                                  'phone (#$_selectedPhoneId)',
+                              style: const TextStyle(color: Colors.black87),
+                            )
+                          : null,
                     ),
-                    style: const TextStyle(color: Colors.black87),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _jidCtrl,
+                      readOnly: true, // Отключаем редактирование
+                      decoration: const InputDecoration(
+                        labelText: 'receiverJid',
+                        hintText: '7900...@s.whatsapp.net',
+                      ),
+                      style: const TextStyle(color: Colors.black87),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -344,120 +977,192 @@ class _MessagesPageState extends State<MessagesPage> {
                     itemCount: _items.length,
                     itemBuilder: (_, i) {
                       final m = _items[i];
-                      final isMine =
-                          m.senderUserId !=
-                          null; // упрощение: если есть senderUserId, считаем исходящим
+                      // Сообщение от оператора если есть senderUser
+                      final isMine = m.senderUser != null;
                       return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.only(bottom: 16),
                         child: Row(
                           mainAxisAlignment: isMine
                               ? MainAxisAlignment.end
                               : MainAxisAlignment.start,
+                          crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
-                            Container(
-                              constraints: BoxConstraints(
-                                maxWidth:
-                                    MediaQuery.of(context).size.width * 0.65,
-                              ),
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: isMine
-                                    ? Theme.of(
-                                        context,
-                                      ).colorScheme.primaryContainer
-                                    : Theme.of(
-                                        context,
-                                      ).colorScheme.surfaceContainerHighest,
-                                borderRadius: BorderRadius.only(
-                                  topLeft: const Radius.circular(16),
-                                  topRight: const Radius.circular(16),
-                                  bottomLeft: isMine
-                                      ? const Radius.circular(16)
-                                      : const Radius.circular(4),
-                                  bottomRight: isMine
-                                      ? const Radius.circular(4)
-                                      : const Radius.circular(16),
+                            if (!isMine) ...[
+                              Container(
+                                margin: const EdgeInsets.only(
+                                  right: 8,
+                                  bottom: 4,
                                 ),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Colors.black.withValues(alpha: 0.05),
-                                    offset: const Offset(0, 1),
-                                    blurRadius: 3,
+                                width: 32,
+                                height: 32,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: CupertinoColors.systemGrey5
+                                      .resolveFrom(context),
+                                ),
+                                child: Icon(
+                                  CupertinoIcons.person_fill,
+                                  color: CupertinoColors.systemGrey.resolveFrom(
+                                    context,
                                   ),
-                                ],
+                                  size: 16,
+                                ),
                               ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (m.senderJid != null || isMine)
-                                    Padding(
-                                      padding: const EdgeInsets.only(
-                                        bottom: 6.0,
+                            ],
+                            GestureDetector(
+                              onLongPress: () {
+                                if (m.content.isNotEmpty) {
+                                  showDialog(
+                                    context: context,
+                                    builder: (context) => AlertDialog(
+                                      title: const Text('Действия'),
+                                      content: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          ListTile(
+                                            leading: const Icon(Icons.copy),
+                                            title: const Text(
+                                              'Копировать текст',
+                                            ),
+                                            onTap: () {
+                                              Clipboard.setData(
+                                                ClipboardData(text: m.content),
+                                              );
+                                              Navigator.pop(context);
+                                              ScaffoldMessenger.of(
+                                                context,
+                                              ).showSnackBar(
+                                                const SnackBar(
+                                                  content: Text(
+                                                    'Текст скопирован',
+                                                  ),
+                                                  duration: Duration(
+                                                    seconds: 1,
+                                                  ),
+                                                ),
+                                              );
+                                            },
+                                          ),
+                                        ],
                                       ),
-                                      child: Text(
-                                        m.senderJid ?? 'Вы',
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(context),
+                                          child: const Text('Закрыть'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                }
+                              },
+                              child: Container(
+                                constraints: BoxConstraints(
+                                  maxWidth:
+                                      MediaQuery.of(context).size.width * 0.7,
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isMine
+                                      ? CupertinoColors.activeBlue.resolveFrom(
+                                          context,
+                                        )
+                                      : CupertinoColors.systemGrey5.resolveFrom(
+                                          context,
+                                        ),
+                                  borderRadius: BorderRadius.only(
+                                    topLeft: const Radius.circular(20),
+                                    topRight: const Radius.circular(20),
+                                    bottomLeft: isMine
+                                        ? const Radius.circular(20)
+                                        : const Radius.circular(4),
+                                    bottomRight: isMine
+                                        ? const Radius.circular(4)
+                                        : const Radius.circular(20),
+                                  ),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    if (m.senderJid != null || isMine)
+                                      Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 6.0,
+                                        ),
+                                        child: Text(
+                                          isMine
+                                              ? (m.senderUser?.name ??
+                                                    m.senderUser?.email ??
+                                                    'Оператор')
+                                              : (m.senderJid ?? 'Клиент'),
+                                          style: TextStyle(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w600,
+                                            color: isMine
+                                                ? CupertinoColors.white
+                                                : CupertinoColors.activeBlue,
+                                          ),
+                                        ),
+                                      ),
+                                    if (m.mediaUrl != null &&
+                                        m.mediaUrl!.isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 8.0,
+                                        ),
+                                        child: _buildMediaWidget(m),
+                                      ),
+                                    if (m.content.isNotEmpty)
+                                      SelectableText(
+                                        m.content,
                                         style: TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
+                                          fontSize: 15,
+                                          height: 1.4,
                                           color: isMine
-                                              ? Theme.of(
-                                                  context,
-                                                ).colorScheme.onPrimaryContainer
-                                              : Theme.of(
-                                                  context,
-                                                ).colorScheme.primary,
+                                              ? CupertinoColors.white
+                                              : CupertinoColors.label
+                                                    .resolveFrom(context),
+                                          fontWeight: FontWeight.w400,
                                         ),
                                       ),
-                                    ),
-                                  if (m.mediaUrl != null &&
-                                      m.mediaUrl!.isNotEmpty)
-                                    Padding(
-                                      padding: const EdgeInsets.only(
-                                        bottom: 8.0,
-                                      ),
-                                      child: _buildMediaWidget(m),
-                                    ),
-                                  if (m.content.isNotEmpty)
-                                    Text(
-                                      m.content,
-                                      style: TextStyle(
-                                        fontSize: 15,
-                                        color: isMine
-                                            ? Theme.of(
-                                                context,
-                                              ).colorScheme.onPrimaryContainer
-                                            : Theme.of(
-                                                context,
-                                              ).colorScheme.onSurface,
-                                      ),
-                                    ),
-                                  const SizedBox(height: 4),
-                                  Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Text(
-                                        m.timestamp
-                                            .toLocal()
-                                            .toString()
-                                            .substring(11, 16),
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          color:
-                                              (isMine
-                                                      ? Theme.of(context)
-                                                            .colorScheme
-                                                            .onPrimaryContainer
-                                                      : Theme.of(context)
-                                                            .colorScheme
-                                                            .onSurfaceVariant)
-                                                  .withValues(alpha: 0.7),
+                                    const SizedBox(height: 6),
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.tag_faces_rounded,
+                                          size: 12,
+                                          color: isMine
+                                              ? CupertinoColors.white
+                                                    .withOpacity(0.7)
+                                              : CupertinoColors.secondaryLabel
+                                                    .resolveFrom(context),
                                         ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          m.timestamp
+                                              .toLocal()
+                                              .toString()
+                                              .substring(11, 16),
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w500,
+                                            color: isMine
+                                                ? CupertinoColors.white
+                                                      .withOpacity(0.8)
+                                                : CupertinoColors.secondaryLabel
+                                                      .resolveFrom(context),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ), // Column
+                              ), // Container
+                            ), // GestureDetector
                           ],
                         ),
                       );
@@ -465,75 +1170,186 @@ class _MessagesPageState extends State<MessagesPage> {
                   ),
           ),
           if (_error != null)
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Text(_error!, style: const TextStyle(color: Colors.red)),
+            Container(
+              margin: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: CupertinoColors.systemRed
+                    .resolveFrom(context)
+                    .withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: CupertinoColors.systemRed
+                      .resolveFrom(context)
+                      .withOpacity(0.3),
+                  width: 1,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    CupertinoIcons.exclamationmark_triangle,
+                    color: CupertinoColors.systemRed.resolveFrom(context),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _error!,
+                      style: TextStyle(
+                        color: CupertinoColors.systemRed.resolveFrom(context),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           Container(
             decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surface,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.05),
-                  offset: const Offset(0, -1),
-                  blurRadius: 4,
+              color: CupertinoColors.systemBackground.resolveFrom(context),
+              border: Border(
+                top: BorderSide(
+                  color: CupertinoColors.separator.resolveFrom(context),
+                  width: 0.5,
                 ),
-              ],
+              ),
             ),
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primaryContainer,
-                    shape: BoxShape.circle,
-                  ),
-                  child: IconButton(
-                    onPressed: _loading ? null : _sendImage,
-                    icon: Icon(
-                      Icons.image_outlined,
-                      color: Theme.of(context).colorScheme.onPrimaryContainer,
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: _loading ? null : _sendImage,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: CupertinoColors.activeBlue.resolveFrom(context),
+                      borderRadius: BorderRadius.circular(14),
                     ),
-                    tooltip: 'Отправить изображение',
+                    padding: const EdgeInsets.all(12),
+                    child: Icon(
+                      CupertinoIcons.photo,
+                      color: CupertinoColors.white,
+                      size: 24,
+                    ),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 12),
                 Expanded(
                   child: Container(
                     decoration: BoxDecoration(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceContainerHighest,
+                      color: CupertinoColors.systemGrey6.resolveFrom(context),
                       borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: CupertinoColors.separator.resolveFrom(context),
+                        width: 0.5,
+                      ),
                     ),
-                    child: TextField(
-                      controller: _textCtrl,
-                      decoration: const InputDecoration(
-                        hintText: 'Сообщение...',
-                        border: InputBorder.none,
-                        contentPadding: EdgeInsets.symmetric(
+                    child: Focus(
+                      onKeyEvent: (node, event) {
+                        // Обработка Enter (отправка) и Shift+Enter (новая строка)
+                        if (event is KeyDownEvent &&
+                            event.logicalKey == LogicalKeyboardKey.enter) {
+                          // Shift+Enter - новая строка (игнорируем, даём стандартное поведение)
+                          if (HardwareKeyboard.instance.isShiftPressed) {
+                            return KeyEventResult.ignored;
+                          }
+                          // Enter без Shift - отправка сообщения
+                          if (_textCtrl.text.trim().isNotEmpty) {
+                            _sendText();
+                            return KeyEventResult.handled;
+                          }
+                          return KeyEventResult.handled;
+                        }
+
+                        // Ctrl+V или Cmd+V для вставки
+                        if (event is KeyDownEvent) {
+                          if (event.logicalKey == LogicalKeyboardKey.keyV &&
+                              (HardwareKeyboard.instance.isControlPressed ||
+                                  HardwareKeyboard.instance.isMetaPressed)) {
+                            _pasteFromClipboard();
+                            return KeyEventResult.handled;
+                          }
+                        }
+                        return KeyEventResult.ignored;
+                      },
+                      child: CupertinoTextField(
+                        controller: _textCtrl,
+                        placeholder:
+                            'Сообщение... (Enter - отправить, Shift+Enter - новая строка)',
+                        placeholderStyle: TextStyle(
+                          fontSize: 14,
+                          color: CupertinoColors.label.resolveFrom(context),
+                        ),
+                        decoration: null,
+                        padding: const EdgeInsets.symmetric(
                           horizontal: 16,
                           vertical: 12,
                         ),
+                        onSubmitted: (text) {
+                          // Enter без Shift отправляет сообщение
+                          if (text.trim().isNotEmpty) {
+                            _sendText();
+                          }
+                        },
+                        textInputAction: TextInputAction.newline,
+                        keyboardType: TextInputType.multiline,
+                        maxLines: null,
                       ),
-                      onSubmitted: (_) => _sendText(),
-                      maxLines: null,
                     ),
                   ),
                 ),
                 const SizedBox(width: 8),
-                Container(
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primary,
-                    shape: BoxShape.circle,
-                  ),
-                  child: IconButton(
-                    onPressed: _loading ? null : _sendText,
-                    icon: Icon(
-                      Icons.send,
-                      color: Theme.of(context).colorScheme.onPrimary,
+                // Кнопка улучшения текста с помощью AI
+                Tooltip(
+                  message:
+                      'Улучшить текст с помощью AI (дружелюбно-формальный стиль)',
+                  child: CupertinoButton(
+                    padding: EdgeInsets.zero,
+                    onPressed:
+                        (_loading ||
+                            _isImprovingText ||
+                            _textCtrl.text.trim().isEmpty)
+                        ? null
+                        : _improveText,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: _isImprovingText
+                            ? CupertinoColors.systemGrey.resolveFrom(context)
+                            : CupertinoColors.systemPurple.resolveFrom(context),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      padding: const EdgeInsets.all(12),
+                      child: _isImprovingText
+                          ? const SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CupertinoActivityIndicator(
+                                color: CupertinoColors.white,
+                              ),
+                            )
+                          : Icon(
+                              CupertinoIcons.sparkles,
+                              color: CupertinoColors.white,
+                              size: 24,
+                            ),
                     ),
-                    tooltip: 'Отправить',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: _loading ? null : _sendText,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: CupertinoColors.activeBlue.resolveFrom(context),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    padding: const EdgeInsets.all(12),
+                    child: Icon(
+                      CupertinoIcons.paperplane_fill,
+                      color: CupertinoColors.white,
+                      size: 24,
+                    ),
                   ),
                 ),
               ],
@@ -554,25 +1370,11 @@ class _MessagesPageState extends State<MessagesPage> {
           constraints: const BoxConstraints(maxWidth: 280, maxHeight: 360),
           child: cached != null
               ? Image(image: cached, fit: BoxFit.cover)
-              : FutureBuilder(
-                  future: widget.client.getBytes(url),
-                  builder: (_, snap) {
-                    if (snap.connectionState == ConnectionState.waiting) {
-                      return const SizedBox(
-                        width: 80,
-                        height: 80,
-                        child: Center(
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      );
-                    }
-                    if (snap.hasError || !snap.hasData) {
-                      return _mediaFallback(url, m.type);
-                    }
-                    final bytes = snap.data!;
-                    final provider = MemoryImage(bytes);
+              : _ImageWithRetry(
+                  client: widget.client,
+                  url: url,
+                  onCached: (provider) {
                     _imageCache[url] = provider;
-                    return Image.memory(bytes, fit: BoxFit.cover);
                   },
                 ),
         ),
@@ -591,12 +1393,12 @@ class _MessagesPageState extends State<MessagesPage> {
     final fileName = Uri.tryParse(url)?.pathSegments.isNotEmpty == true
         ? Uri.parse(url).pathSegments.last
         : url;
-    return InkWell(
+    return GestureDetector(
       onLongPress: () => Clipboard.setData(ClipboardData(text: url)),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.attach_file, size: 16),
+          const Icon(CupertinoIcons.paperclip, size: 16),
           const SizedBox(width: 6),
           Flexible(
             child: Text('$type: $fileName', overflow: TextOverflow.ellipsis),
@@ -604,5 +1406,148 @@ class _MessagesPageState extends State<MessagesPage> {
         ],
       ),
     );
+  }
+}
+
+// Виджет для загрузки изображения с повторными попытками
+class _ImageWithRetry extends StatefulWidget {
+  final dynamic client;
+  final String url;
+  final Function(MemoryImage) onCached;
+
+  const _ImageWithRetry({
+    required this.client,
+    required this.url,
+    required this.onCached,
+  });
+
+  @override
+  State<_ImageWithRetry> createState() => _ImageWithRetryState();
+}
+
+class _ImageWithRetryState extends State<_ImageWithRetry> {
+  int _attemptCount = 0;
+  static const int _maxAttempts = 3;
+  bool _loading = true;
+  String? _error;
+  Uint8List? _imageBytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadImage();
+  }
+
+  Future<void> _loadImage() async {
+    if (_attemptCount >= _maxAttempts) {
+      setState(() {
+        _loading = false;
+        _error = 'Не удалось загрузить изображение';
+      });
+      return;
+    }
+
+    _attemptCount++;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final bytes = await widget.client.getBytes(widget.url);
+      if (mounted) {
+        final provider = MemoryImage(bytes);
+        widget.onCached(provider);
+        setState(() {
+          _imageBytes = bytes;
+          _loading = false;
+          _error = null;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        if (_attemptCount < _maxAttempts) {
+          // Повторная попытка через небольшую задержку
+          await Future.delayed(Duration(milliseconds: 500 * _attemptCount));
+          if (mounted) {
+            _loadImage();
+          }
+        } else {
+          setState(() {
+            _loading = false;
+            _error = 'Не удалось загрузить изображение';
+          });
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return SizedBox(
+        width: 80,
+        height: 80,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(strokeWidth: 2),
+              if (_attemptCount > 1)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Text(
+                    'Попытка $_attemptCount/$_maxAttempts',
+                    style: const TextStyle(fontSize: 10),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_error != null) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade200,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.broken_image_outlined,
+              size: 48,
+              color: Colors.grey.shade600,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Изображение отправлено,\nне удалось отобразить',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () {
+                _attemptCount = 0;
+                _loadImage();
+              },
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Повторить'),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 4,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Image.memory(_imageBytes!, fit: BoxFit.cover);
   }
 }

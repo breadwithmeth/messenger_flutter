@@ -96,7 +96,7 @@ class _PhonesPageState extends State<PhonesPage> {
 
   void _startPolling() {
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+    _pollTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!mounted || _loading) return;
       await _load();
     });

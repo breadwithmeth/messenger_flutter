@@ -43,7 +43,7 @@ class _TicketDetailPaneState extends State<TicketDetailPane> {
 
   void _startPolling() {
     _poller?.cancel();
-    _poller = Timer.periodic(const Duration(seconds: 5), (_) async {
+    _poller = Timer.periodic(const Duration(seconds: 15), (_) async {
       if (!mounted) return;
       if (_loading) return;
       try {

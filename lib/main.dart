@@ -1,17 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'api/api_client.dart';
 import 'api/auth_service.dart';
-import 'api/tickets_service.dart';
-import 'models/ticket_models.dart';
+import 'api/chats_service.dart';
+import 'api/unread_service.dart';
+import 'api/accounts_service.dart';
+import 'models/chat_models.dart';
 import 'config.dart';
 import 'screens/login_page.dart';
 import 'screens/organizations_page.dart';
 import 'screens/users_page.dart';
 import 'screens/phones_page.dart';
 import 'screens/unread_page.dart';
-import 'screens/ticket_messages_page.dart';
+import 'screens/messages_page.dart';
 import 'screens/wa_page.dart';
-import 'screens/ticket_detail_pane.dart';
+import 'screens/telegram_bots_page.dart';
+import 'screens/settings_page.dart';
 import 'models/auth_models.dart';
 import 'theme_provider.dart';
 import 'theme_colors.dart';
@@ -129,7 +133,7 @@ class _MyAppState extends State<MyApp> {
         ),
       ),
       themeMode: _themeProvider.themeMode,
-      home: MyHomePage(title: 'Тикеты', themeProvider: _themeProvider),
+      home: MyHomePage(title: 'Чаты', themeProvider: _themeProvider),
     );
   }
 }
@@ -160,24 +164,23 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   late final ApiClient _client;
   late final AuthService _auth;
-  late final TicketsService _tickets;
-  List<TicketDto> _items = [];
+  late final ChatsService _chats;
+  late final UnreadService _unread;
+  List<ChatDto> _items = [];
   bool _loading = false;
   String? _error;
   UserDto? _me;
-  TicketDto? _selectedTicket;
+  ChatDto? _selectedChat;
+  bool _loadingSelectedChat = false;
   Timer? _poller;
-
-  // Фильтры
-  String? _filterStatus;
-  String? _filterPriority;
 
   @override
   void initState() {
     super.initState();
     _client = ApiClient(baseUrl: AppConfig.baseUrl);
     _auth = AuthService(_client);
-    _tickets = TicketsService(_client);
+    _chats = ChatsService(_client);
+    _unread = UnreadService(_client);
     _bootstrap();
     _startPolling();
   }
@@ -197,7 +200,7 @@ class _MyHomePageState extends State<MyHomePage> {
       }
       // Получим текущего пользователя для operatorId при назначении
       _me = await _auth.me();
-      await _loadTickets();
+      await _loadChats();
     } catch (e) {
       setState(() => _error = '$e');
     } finally {
@@ -205,76 +208,29 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> _assignToMe(TicketDto t) async {
-    if (_me == null) return;
-    setState(() => _loading = true);
-    try {
-      await _tickets.assignTicket(t.ticketNumber, _me!.id);
-      await _loadTickets();
-    } catch (e) {
-      setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _unassignTicket(TicketDto t) async {
-    setState(() => _loading = true);
-    try {
-      await _tickets.unassignTicket(t.ticketNumber);
-      await _loadTickets();
-    } catch (e) {
-      setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _setPriority(TicketDto t, String p) async {
-    setState(() => _loading = true);
-    try {
-      await _tickets.changePriority(t.ticketNumber, p);
-      await _loadTickets();
-    } catch (e) {
-      setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _closeTicket(TicketDto t) async {
-    setState(() => _loading = true);
-    try {
-      await _tickets.changeStatus(t.ticketNumber, 'closed');
-      await _loadTickets();
-    } catch (e) {
-      setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _loadTickets() async {
-    final resp = await _tickets.getTickets(
-      status: _filterStatus,
-      priority: _filterPriority,
+  Future<void> _loadChats() async {
+    final resp = await _chats.listChats(
+      sortBy: 'lastMessageAt',
+      sortOrder: 'desc',
     );
     setState(() {
-      _items = resp.tickets;
-      if (_selectedTicket != null) {
-        final selNum = _selectedTicket!.ticketNumber;
-        final idx = _items.indexWhere((e) => e.ticketNumber == selNum);
-        _selectedTicket = idx >= 0 ? _items[idx] : null;
+      // Сервер уже вернул отсортированные чаты
+      _items = resp.chats;
+
+      if (_selectedChat != null) {
+        final selId = _selectedChat!.id;
+        final idx = _items.indexWhere((e) => e.id == selId);
+        _selectedChat = idx >= 0 ? _items[idx] : null;
       }
     });
   }
 
   Future<void> _markAllAsRead() async {
-    final unreadTickets = _items.where((t) => t.unreadCount > 0).toList();
-    if (unreadTickets.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Нет непрочитанных тикетов')),
-      );
+    final unreadChats = _items.where((c) => c.unreadCount > 0).toList();
+    if (unreadChats.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Нет непрочитанных чатов')));
       return;
     }
 
@@ -285,7 +241,7 @@ class _MyHomePageState extends State<MyHomePage> {
         builder: (context) => AlertDialog(
           title: const Text('Пометить все как прочитанные?'),
           content: Text(
-            'Будет отмечено ${unreadTickets.length} тикет(ов) как прочитанные',
+            'Будет отмечено ${unreadChats.length} чат(ов) как прочитанные',
           ),
           actions: [
             TextButton(
@@ -304,23 +260,21 @@ class _MyHomePageState extends State<MyHomePage> {
 
       setState(() => _loading = true);
 
-      // Помечаем все непрочитанные тикеты
-      for (final _ in unreadTickets) {
+      // Помечаем все непрочитанные чаты
+      for (final chat in unreadChats) {
         try {
-          // Здесь должен быть API метод для пометки как прочитанного
-          // Пока просто обновляем список
-          await Future.delayed(const Duration(milliseconds: 100));
+          await _unread.markChatRead(chat.id);
         } catch (e) {
-          // Игнорируем ошибки для отдельных тикетов
+          // Игнорируем ошибки для отдельных чатов
         }
       }
 
-      await _loadTickets();
+      await _loadChats();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Отмечено ${unreadTickets.length} тикет(ов)'),
+            content: Text('Отмечено ${unreadChats.length} чат(ов)'),
             backgroundColor: Colors.green,
           ),
         );
@@ -340,11 +294,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _startPolling() {
     _poller?.cancel();
-    _poller = Timer.periodic(const Duration(seconds: 2), (_) async {
+    _poller = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!mounted) return;
       if (_loading) return;
       try {
-        await _loadTickets();
+        await _loadChats();
       } catch (_) {
         // мягко игнорируем ошибки опроса
       }
@@ -363,183 +317,365 @@ class _MyHomePageState extends State<MyHomePage> {
     ).push<bool>(MaterialPageRoute(builder: (_) => LoginPage(auth: _auth)));
     if (success == true) {
       _me = await _auth.me();
-      await _loadTickets();
+      await _loadChats();
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        elevation: 2,
-        shadowColor: Colors.black.withValues(alpha: 0.1),
-        backgroundColor: Theme.of(context).colorScheme.surface,
-        foregroundColor: Theme.of(context).colorScheme.onSurface,
-        title: Row(
+      appBar: CupertinoNavigationBar(
+        backgroundColor: CupertinoColors.systemBackground.resolveFrom(context),
+        border: Border(
+          bottom: BorderSide(
+            color: CupertinoColors.separator.resolveFrom(context),
+            width: 0.5,
+          ),
+        ),
+        leading: Builder(
+          builder: (context) => CupertinoButton(
+            padding: EdgeInsets.zero,
+            onPressed: () => Scaffold.of(context).openDrawer(),
+            child: const Icon(CupertinoIcons.line_horizontal_3, size: 28),
+          ),
+        ),
+        middle: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.confirmation_number,
-              color: Theme.of(context).colorScheme.primary,
+              CupertinoIcons.chat_bubble_2_fill,
+              color: CupertinoColors.activeBlue.resolveFrom(context),
+              size: 22,
             ),
             const SizedBox(width: 8),
-            Text(widget.title),
+            Text(
+              widget.title,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
           ],
         ),
-        actions: [
-          IconButton(
-            icon: Icon(
-              Icons.done_all,
-              color: _items.any((t) => t.unreadCount > 0)
-                  ? Theme.of(context).colorScheme.primary
-                  : null,
-            ),
-            onPressed: _markAllAsRead,
-            tooltip: 'Пометить все прочитанными',
-          ),
-          IconButton(
-            icon: Icon(
-              Icons.filter_list,
-              color: _filterStatus != null || _filterPriority != null
-                  ? Theme.of(context).colorScheme.primary
-                  : null,
-            ),
-            onPressed: _showFilterDialog,
-            tooltip: 'Фильтры',
-          ),
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _loadTickets,
-            tooltip: 'Обновить',
-          ),
-        ],
-      ),
-      drawer: Drawer(
-        child: ListView(
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            DrawerHeader(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    Theme.of(context).colorScheme.primary,
-                    Theme.of(context).colorScheme.primaryContainer,
-                  ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  CircleAvatar(
-                    radius: 32,
-                    backgroundColor: Theme.of(context).colorScheme.onPrimary,
-                    child: Icon(
-                      Icons.person,
-                      size: 32,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    _me?.email ?? 'Мессенджер',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onPrimary,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _showNewChatDialog,
+              child: const Icon(
+                CupertinoIcons.plus_circle_fill,
+                color: CupertinoColors.activeBlue,
+                size: 28,
               ),
             ),
-            ListTile(
-              leading: const Icon(Icons.business),
-              title: const Text('Организации'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => OrganizationsPage(client: _client),
-                  ),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.people_outline),
-              title: const Text('Пользователи'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => UsersPage(client: _client)),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.phone_android),
-              title: const Text('Номера'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => PhonesPage(client: _client),
-                  ),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.mark_email_unread_outlined),
-              title: const Text('Непрочитанные'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => UnreadPage(client: _client),
-                  ),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.chat_bubble_outline),
-              title: const Text('WA сессия'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => WaPage(client: _client)),
-                );
-              },
-            ),
-            const Divider(),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text(
-                'Оформление',
-                style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                  color: Theme.of(context).colorScheme.primary,
-                  fontWeight: FontWeight.w600,
-                ),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _markAllAsRead,
+              child: Icon(
+                CupertinoIcons.checkmark_alt_circle_fill,
+                color: _items.any((c) => c.unreadCount > 0)
+                    ? CupertinoColors.activeBlue
+                    : CupertinoColors.systemGrey,
+                size: 28,
               ),
             ),
-            ListTile(
-              leading: Icon(
-                widget.themeProvider.isLight
-                    ? Icons.light_mode
-                    : widget.themeProvider.isDark
-                    ? Icons.dark_mode
-                    : Icons.brightness_auto,
-              ),
-              title: const Text('Тема'),
-              subtitle: Text(
-                widget.themeProvider.isLight
-                    ? 'Светлая'
-                    : widget.themeProvider.isDark
-                    ? 'Темная'
-                    : 'Системная',
-              ),
-              onTap: () {
-                _showThemeDialog();
-              },
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _loadChats,
+              child: const Icon(CupertinoIcons.refresh, size: 28),
             ),
           ],
+        ),
+      ),
+      drawer: Drawer(
+        backgroundColor: CupertinoColors.systemBackground.resolveFrom(context),
+        child: SafeArea(
+          child: ListView(
+            padding: EdgeInsets.zero,
+            children: [
+              // Header
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: CupertinoColors.systemGrey6.resolveFrom(context),
+                  border: Border(
+                    bottom: BorderSide(
+                      color: CupertinoColors.separator.resolveFrom(context),
+                      width: 0.5,
+                    ),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: CupertinoColors.systemGrey5.resolveFrom(context),
+                      ),
+                      child: Icon(
+                        CupertinoIcons.person_fill,
+                        size: 32,
+                        color: CupertinoColors.systemGrey.resolveFrom(context),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _me?.email ?? 'Мессенджер',
+                      style: TextStyle(
+                        color: CupertinoColors.label.resolveFrom(context),
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Организации
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.building_2_fill,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                ),
+                title: Text(
+                  'Организации',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => OrganizationsPage(client: _client),
+                    ),
+                  );
+                },
+              ),
+              // Пользователи
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.person_2_fill,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                ),
+                title: Text(
+                  'Пользователи',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => UsersPage(client: _client),
+                    ),
+                  );
+                },
+              ),
+              // Номера
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.device_phone_portrait,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                ),
+                title: Text(
+                  'Номера',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => PhonesPage(client: _client),
+                    ),
+                  );
+                },
+              ),
+              // Непрочитанные
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.envelope_badge_fill,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                ),
+                title: Text(
+                  'Непрочитанные',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => UnreadPage(client: _client),
+                    ),
+                  );
+                },
+              ),
+              // WA сессия
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.chat_bubble_2_fill,
+                  color: CupertinoColors.systemGreen.resolveFrom(context),
+                ),
+                title: Text(
+                  'WA сессия',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(builder: (_) => WaPage(client: _client)),
+                  );
+                },
+              ),
+              // Telegram боты
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.chat_bubble_text_fill,
+                  color: CupertinoColors.activeBlue.resolveFrom(context),
+                ),
+                title: Text(
+                  'Telegram боты',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  final orgId = _me?.organizationId ?? 1;
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => TelegramBotsPage(
+                        client: _client,
+                        organizationId: orgId,
+                      ),
+                    ),
+                  );
+                },
+              ),
+              // Разделитель
+              Container(
+                height: 0.5,
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                color: CupertinoColors.separator.resolveFrom(context),
+              ),
+              // Настройки
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.settings,
+                  color: CupertinoColors.systemGrey.resolveFrom(context),
+                ),
+                title: Text(
+                  'Настройки',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(builder: (_) => const SettingsPage()),
+                  );
+                },
+              ),
+              // Разделитель
+              Container(
+                height: 0.5,
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                color: CupertinoColors.separator.resolveFrom(context),
+              ),
+              // Заголовок секции
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: Text(
+                  'ОФОРМЛЕНИЕ',
+                  style: TextStyle(
+                    color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: -0.08,
+                  ),
+                ),
+              ),
+              // Тема
+              CupertinoListTile(
+                leading: Icon(
+                  widget.themeProvider.isLight
+                      ? CupertinoIcons.sun_max_fill
+                      : widget.themeProvider.isDark
+                      ? CupertinoIcons.moon_fill
+                      : CupertinoIcons.brightness,
+                  color: CupertinoColors.systemOrange.resolveFrom(context),
+                ),
+                title: Text(
+                  'Тема',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                subtitle: Text(
+                  widget.themeProvider.isLight
+                      ? 'Светлая'
+                      : widget.themeProvider.isDark
+                      ? 'Темная'
+                      : 'Системная',
+                  style: TextStyle(
+                    color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                    fontSize: 14,
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  _showThemeDialog();
+                },
+              ),
+            ],
+          ),
         ),
       ),
       body: _loading
@@ -548,119 +684,147 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  void _showFilterDialog() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        String? tempStatus = _filterStatus;
-        String? tempPriority = _filterPriority;
+  Future<void> _showNewChatDialog() async {
+    final phoneController = TextEditingController();
+    final jidController = TextEditingController();
+    int? selectedOrgPhoneId;
+    List<dynamic> orgPhones = [];
 
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text('Фильтры'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Статус',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _filterChip('Все', null, tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('Новый', 'new', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('Открыт', 'open', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('В работе', 'in_progress', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('Ожидание', 'pending', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('Решён', 'resolved', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                        _filterChip('Закрыт', 'closed', tempStatus, (v) {
-                          setDialogState(() => tempStatus = v);
-                        }),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Приоритет',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _filterChip('Все', null, tempPriority, (v) {
-                          setDialogState(() => tempPriority = v);
-                        }),
-                        _filterChip('Низкий', 'low', tempPriority, (v) {
-                          setDialogState(() => tempPriority = v);
-                        }),
-                        _filterChip('Обычный', 'normal', tempPriority, (v) {
-                          setDialogState(() => tempPriority = v);
-                        }),
-                        _filterChip('Высокий', 'high', tempPriority, (v) {
-                          setDialogState(() => tempPriority = v);
-                        }),
-                        _filterChip('Срочный', 'urgent', tempPriority, (v) {
-                          setDialogState(() => tempPriority = v);
-                        }),
-                      ],
-                    ),
-                  ],
+    // Загружаем доступные номера организации
+    try {
+      final phonesService = OrganizationPhonesService(_client);
+      orgPhones = await phonesService.all();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка загрузки номеров: $e'),
+            backgroundColor: CupertinoColors.systemRed,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Новый чат'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: phoneController,
+                  decoration: const InputDecoration(
+                    labelText: 'Номер клиента',
+                    hintText: '79991234567 плюс не писать',
+                    prefixIcon: Icon(CupertinoIcons.phone),
+                  ),
+                  keyboardType: TextInputType.phone,
                 ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                  },
-                  child: const Text('Отмена'),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: jidController,
+                  decoration: const InputDecoration(
+                    labelText: 'JID (опционально)',
+                    hintText: '79991234567@s.whatsapp.net',
+                    prefixIcon: Icon(CupertinoIcons.at),
+                  ),
                 ),
-                TextButton(
-                  onPressed: () {
+                const SizedBox(height: 16),
+                DropdownButtonFormField<int>(
+                  value: selectedOrgPhoneId,
+                  decoration: const InputDecoration(
+                    labelText: 'Номер организации',
+                    prefixIcon: Icon(CupertinoIcons.building_2_fill),
+                  ),
+                  items: orgPhones
+                      .map(
+                        (e) => DropdownMenuItem<int>(
+                          value: e['id'] as int?,
+                          child: Text(
+                            '${e['displayName'] ?? 'phone'} (#${e['id'] ?? ''})',
+                          ),
+                        ),
+                      )
+                      .where((e) => e.value != null)
+                      .cast<DropdownMenuItem<int>>()
+                      .toList(),
+                  onChanged: (value) {
                     setState(() {
-                      _filterStatus = null;
-                      _filterPriority = null;
+                      selectedOrgPhoneId = value;
                     });
-                    Navigator.pop(context);
-                    _loadTickets();
                   },
-                  child: const Text('Сбросить'),
-                ),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _filterStatus = tempStatus;
-                      _filterPriority = tempPriority;
-                    });
-                    Navigator.pop(context);
-                    _loadTickets();
-                  },
-                  child: const Text('Применить'),
                 ),
               ],
-            );
-          },
-        );
-      },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (phoneController.text.isEmpty ||
+                    selectedOrgPhoneId == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Заполните номер клиента и выберите номер организации',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+                Navigator.pop(context, {
+                  'phone': phoneController.text,
+                  'jid': jidController.text.isEmpty ? null : jidController.text,
+                  'orgPhoneId': selectedOrgPhoneId,
+                });
+              },
+              child: const Text('Создать'),
+            ),
+          ],
+        ),
+      ),
     );
+
+    if (result != null && mounted) {
+      await _createNewChat(
+        result['phone'] as String,
+        result['jid'] as String?,
+        result['orgPhoneId'] as int,
+      );
+    }
+  }
+
+  Future<void> _createNewChat(String phone, String? jid, int orgPhoneId) async {
+    // Просто открываем страницу сообщений с новым клиентом
+    // Чат создастся автоматически при отправке первого сообщения
+    if (!mounted) return;
+
+    final receiverJid = jid ?? '$phone@s.whatsapp.net';
+
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute(
+            builder: (_) => MessagesPage(
+              client: _client,
+              chatId: 0, // Новый чат, ID будет создан после первого сообщения
+              initialReceiverJid: receiverJid,
+              initialOrganizationPhoneId: orgPhoneId,
+            ),
+          ),
+        )
+        .then((_) {
+          // После возврата обновляем список чатов
+          _loadChats();
+        });
   }
 
   void _showThemeDialog() {
@@ -675,7 +839,7 @@ class _MyHomePageState extends State<MyHomePage> {
               RadioListTile<ThemeMode>(
                 title: const Text('Светлая'),
                 subtitle: const Text('Всегда использовать светлую тему'),
-                secondary: const Icon(Icons.light_mode),
+                secondary: const Icon(CupertinoIcons.sun_max_fill),
                 value: ThemeMode.light,
                 groupValue: widget.themeProvider.themeMode,
                 onChanged: (ThemeMode? value) {
@@ -688,7 +852,7 @@ class _MyHomePageState extends State<MyHomePage> {
               RadioListTile<ThemeMode>(
                 title: const Text('Темная'),
                 subtitle: const Text('Всегда использовать темную тему'),
-                secondary: const Icon(Icons.dark_mode),
+                secondary: const Icon(CupertinoIcons.moon_fill),
                 value: ThemeMode.dark,
                 groupValue: widget.themeProvider.themeMode,
                 onChanged: (ThemeMode? value) {
@@ -701,7 +865,7 @@ class _MyHomePageState extends State<MyHomePage> {
               RadioListTile<ThemeMode>(
                 title: const Text('Системная'),
                 subtitle: const Text('Следовать настройкам системы'),
-                secondary: const Icon(Icons.brightness_auto),
+                secondary: const Icon(CupertinoIcons.brightness),
                 value: ThemeMode.system,
                 groupValue: widget.themeProvider.themeMode,
                 onChanged: (ThemeMode? value) {
@@ -726,44 +890,6 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _filterChip(
-    String label,
-    String? value,
-    String? current,
-    Function(String?) onTap,
-  ) {
-    final selected = current == value;
-    return InkWell(
-      onTap: () => onTap(value),
-      borderRadius: BorderRadius.circular(20),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: selected
-              ? Theme.of(context).colorScheme.primaryContainer
-              : Theme.of(context).colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(20),
-          border: selected
-              ? Border.all(
-                  color: Theme.of(context).colorScheme.primary,
-                  width: 2,
-                )
-              : null,
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 13,
-            fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
-            color: selected
-                ? Theme.of(context).colorScheme.onPrimaryContainer
-                : Theme.of(context).colorScheme.onSurface,
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _buildBody() {
     if (_error != null) {
       return Center(
@@ -773,9 +899,9 @@ class _MyHomePageState extends State<MyHomePage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
-                Icons.error_outline,
+                CupertinoIcons.exclamationmark_triangle,
                 size: 64,
-                color: AppColors.errorText(context),
+                color: CupertinoColors.systemRed.resolveFrom(context),
               ),
               const SizedBox(height: 16),
               Text(
@@ -804,22 +930,22 @@ class _MyHomePageState extends State<MyHomePage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  Icons.confirmation_number_outlined,
+                  CupertinoIcons.chat_bubble_2,
                   size: 80,
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.primary.withValues(alpha: 0.2),
+                  color: CupertinoColors.systemGrey
+                      .resolveFrom(context)
+                      .withOpacity(0.3),
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  'Нет тикетов',
+                  'Нет чатов',
                   style: Theme.of(context).textTheme.titleLarge?.copyWith(
                     color: AppColors.textSecondary(context),
                   ),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Тикеты появятся здесь автоматически',
+                  'Чаты появятся здесь автоматически',
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                     color: AppColors.textTertiary(context),
                   ),
@@ -830,7 +956,7 @@ class _MyHomePageState extends State<MyHomePage> {
         }
 
         if (!isWide) {
-          return _buildTicketList(isWide: false);
+          return _buildChatList(isWide: false);
         }
 
         return Row(
@@ -848,25 +974,25 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
               child: Column(
-                children: [Expanded(child: _buildTicketList(isWide: true))],
+                children: [Expanded(child: _buildChatList(isWide: true))],
               ),
             ),
             Expanded(
-              child: _selectedTicket == null
+              child: _selectedChat == null
                   ? Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            Icons.confirmation_number_outlined,
+                            CupertinoIcons.chat_bubble_2,
                             size: 80,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.primary.withValues(alpha: 0.2),
+                            color: CupertinoColors.systemGrey
+                                .resolveFrom(context)
+                                .withOpacity(0.3),
                           ),
                           const SizedBox(height: 16),
                           Text(
-                            'Выберите тикет',
+                            'Выберите чат',
                             style: Theme.of(context).textTheme.titleLarge
                                 ?.copyWith(
                                   color: AppColors.textSecondary(context),
@@ -874,7 +1000,7 @@ class _MyHomePageState extends State<MyHomePage> {
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            'Нажмите на тикет слева, чтобы посмотреть детали',
+                            'Нажмите на чат слева, чтобы посмотреть сообщения',
                             style: Theme.of(context).textTheme.bodyMedium
                                 ?.copyWith(
                                   color: AppColors.textTertiary(context),
@@ -883,9 +1009,32 @@ class _MyHomePageState extends State<MyHomePage> {
                         ],
                       ),
                     )
-                  : _TicketTabbedView(
+                  : _loadingSelectedChat
+                  ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Загрузка чата...',
+                            style: Theme.of(context).textTheme.bodyMedium
+                                ?.copyWith(
+                                  color: AppColors.textSecondary(context),
+                                ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : MessagesPage(
                       client: _client,
-                      ticket: _selectedTicket!,
+                      chatId: _selectedChat!.id,
+                      initialReceiverJid: _selectedChat!.remoteJid,
+                      initialOrganizationPhoneId:
+                          _selectedChat!.organizationPhoneId,
+                      chat: _selectedChat, // Передаем объект чата
                     ),
             ),
           ],
@@ -894,18 +1043,16 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildTicketList({required bool isWide}) {
+  Widget _buildChatList({required bool isWide}) {
     return ListView.builder(
       padding: const EdgeInsets.symmetric(vertical: 8),
       itemCount: _items.length,
       itemBuilder: (_, i) {
         final t = _items[i];
-        final title = t.subject?.isNotEmpty == true
-            ? t.subject!
-            : 'Тикет #${t.ticketNumber}';
-        final lastTs = t.lastMessage?.timestamp ?? t.updatedAt;
+        final title = t.displayName; // Используем новый геттер
+        final lastTs = t.lastMessage?.timestamp;
         final lastText = t.lastMessage?.content ?? '';
-        final selected = _selectedTicket?.ticketNumber == t.ticketNumber;
+        final selected = _selectedChat?.id == t.id;
 
         return TweenAnimationBuilder<double>(
           duration: Duration(milliseconds: 300 + (i * 50).clamp(0, 500)),
@@ -918,298 +1065,237 @@ class _MyHomePageState extends State<MyHomePage> {
             );
           },
           child: Container(
-            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            margin: const EdgeInsets.symmetric(horizontal: 0, vertical: 0),
             decoration: BoxDecoration(
               color: selected
-                  ? Theme.of(
-                      context,
-                    ).colorScheme.primaryContainer.withValues(alpha: 0.3)
-                  : Colors.transparent,
-              borderRadius: BorderRadius.circular(12),
+                  ? CupertinoColors.systemGrey6.resolveFrom(context)
+                  : CupertinoColors.systemBackground.resolveFrom(context),
+              border: Border(
+                bottom: BorderSide(
+                  color: CupertinoColors.separator.resolveFrom(context),
+                  width: 0.5,
+                ),
+              ),
             ),
-            child: Material(
-              color: Colors.transparent,
-              child: InkWell(
-                borderRadius: BorderRadius.circular(12),
-                onTap: () async {
-                  setState(() => _selectedTicket = t);
-                  if (!isWide) {
-                    await Navigator.of(context).push(
-                      PageRouteBuilder(
-                        pageBuilder: (context, animation, secondaryAnimation) =>
-                            TicketMessagesPage(
-                              client: _client,
-                              ticketNumber: t.ticketNumber,
-                              ticketSubject: t.subject,
-                              clientName: t.clientName,
-                              clientPhone: t.clientPhone,
-                            ),
-                        transitionsBuilder:
-                            (context, animation, secondaryAnimation, child) {
-                              const begin = Offset(1.0, 0.0);
-                              const end = Offset.zero;
-                              const curve = Curves.easeInOutCubic;
-                              var tween = Tween(
-                                begin: begin,
-                                end: end,
-                              ).chain(CurveTween(curve: curve));
-                              var offsetAnimation = animation.drive(tween);
-                              return SlideTransition(
-                                position: offsetAnimation,
-                                child: child,
-                              );
-                            },
-                      ),
-                    );
+            child: CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: () async {
+                setState(() {
+                  _selectedChat = t;
+                  _loadingSelectedChat = true;
+                });
 
-                    // После возврата со страницы сообщений — обновим список
-                    try {
-                      await _loadTickets();
-                    } catch (_) {
-                      // Игнорируем ошибки при немедленном обновлении
-                    }
+                // Небольшая задержка для показа индикатора загрузки
+                await Future.delayed(const Duration(milliseconds: 100));
+
+                setState(() {
+                  _loadingSelectedChat = false;
+                });
+
+                if (!isWide) {
+                  await Navigator.of(context).push(
+                    PageRouteBuilder(
+                      pageBuilder: (context, animation, secondaryAnimation) =>
+                          MessagesPage(
+                            client: _client,
+                            chatId: t.id,
+                            initialReceiverJid: t.remoteJid,
+                            initialOrganizationPhoneId: t.organizationPhoneId,
+                            chat: t, // Передаем объект чата
+                          ),
+                      transitionsBuilder:
+                          (context, animation, secondaryAnimation, child) {
+                            const begin = Offset(1.0, 0.0);
+                            const end = Offset.zero;
+                            const curve = Curves.easeInOutCubic;
+                            var tween = Tween(
+                              begin: begin,
+                              end: end,
+                            ).chain(CurveTween(curve: curve));
+                            var offsetAnimation = animation.drive(tween);
+                            return SlideTransition(
+                              position: offsetAnimation,
+                              child: child,
+                            );
+                          },
+                    ),
+                  );
+
+                  // После возврата со страницы сообщений — обновим список
+                  try {
+                    await _loadChats();
+                  } catch (_) {
+                    // Игнорируем ошибки при немедленном обновлении
                   }
-                },
-                child: ListTile(
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  leading: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      Hero(
-                        tag: 'ticket_avatar_${t.ticketNumber}',
-                        child: CircleAvatar(
-                          radius: 24,
-                          backgroundColor: Theme.of(
-                            context,
-                          ).colorScheme.primaryContainer,
-                          child: Icon(
-                            Icons.confirmation_number,
-                            color: Theme.of(context).colorScheme.primary,
-                          ),
-                        ),
-                      ),
-                      if (t.unreadCount > 0)
-                        Positioned(
-                          right: -4,
-                          top: -4,
+                }
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                child: Row(
+                  children: [
+                    Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Hero(
+                          tag: 'chat_avatar_${t.id}',
                           child: Container(
-                            padding: const EdgeInsets.all(4),
+                            width: 50,
+                            height: 50,
                             decoration: BoxDecoration(
-                              color: Theme.of(context).colorScheme.error,
                               shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white, width: 2),
+                              color: t.isTelegram
+                                  ? CupertinoColors.activeBlue
+                                        .resolveFrom(context)
+                                        .withOpacity(0.1)
+                                  : CupertinoColors.systemGrey5.resolveFrom(
+                                      context,
+                                    ),
                             ),
-                            constraints: const BoxConstraints(
-                              minWidth: 20,
-                              minHeight: 20,
-                            ),
-                            child: Text(
-                              '${t.unreadCount > 9 ? '9+' : t.unreadCount}',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                              ),
-                              textAlign: TextAlign.center,
+                            child: Icon(
+                              t.isTelegram
+                                  ? CupertinoIcons.chat_bubble_text_fill
+                                  : CupertinoIcons.person_fill,
+                              color: t.isTelegram
+                                  ? CupertinoColors.activeBlue.resolveFrom(
+                                      context,
+                                    )
+                                  : CupertinoColors.systemGrey.resolveFrom(
+                                      context,
+                                    ),
+                              size: 24,
                             ),
                           ),
                         ),
-                    ],
-                  ),
-                  title: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          title,
-                          style: TextStyle(
-                            fontWeight: t.unreadCount > 0
-                                ? FontWeight.w600
-                                : FontWeight.normal,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      if (lastTs != null) ...[
-                        const SizedBox(width: 8),
-                        Text(
-                          _formatTime(lastTs),
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: t.unreadCount > 0
-                                ? Theme.of(context).colorScheme.primary
-                                : AppColors.textTertiary(context),
-                            fontWeight: t.unreadCount > 0
-                                ? FontWeight.w600
-                                : FontWeight.normal,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                  subtitle: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          _statusChip(t.status),
-                          const SizedBox(width: 6),
-                          _priorityChip(t.priority),
-                          if (t.assignedUser != null) ...[
-                            const SizedBox(width: 6),
-                            Container(
+                        if (t.unreadCount > 0)
+                          Positioned(
+                            right: -4,
+                            top: -4,
+                            child: Container(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
+                                horizontal: 6,
+                                vertical: 2,
                               ),
                               decoration: BoxDecoration(
-                                color: AppColors.assignedUserBackground(
-                                  context,
-                                ),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: AppColors.assignedUserBorder(context),
-                                  width: 1,
-                                ),
+                                color: CupertinoColors.systemRed,
+                                borderRadius: BorderRadius.circular(10),
                               ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.person,
-                                    size: 14,
-                                    color: AppColors.assignedUserIcon(context),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    t.assignedUser!.name?.isNotEmpty == true
-                                        ? t.assignedUser!.name!
-                                        : (t.assignedUser!.email ?? 'User'),
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: AppColors.assignedUserText(
-                                        context,
-                                      ),
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                ],
+                              constraints: const BoxConstraints(
+                                minWidth: 20,
+                                minHeight: 20,
+                              ),
+                              child: Text(
+                                '${t.unreadCount > 99 ? '99+' : t.unreadCount}',
+                                style: const TextStyle(
+                                  color: CupertinoColors.white,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                textAlign: TextAlign.center,
                               ),
                             ),
-                          ],
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      if (t.clientName != null || t.clientPhone != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 4),
-                          child: Row(
+                          ),
+                      ],
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
                             children: [
-                              Icon(
-                                Icons.person_outline,
-                                size: 14,
-                                color: AppColors.textTertiary(context),
-                              ),
-                              const SizedBox(width: 4),
+                              if (t.isTelegram) ...[
+                                Icon(
+                                  CupertinoIcons.chat_bubble_text_fill,
+                                  size: 14,
+                                  color: CupertinoColors.activeBlue.resolveFrom(
+                                    context,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                              ],
                               Expanded(
                                 child: Text(
-                                  [
-                                    if (t.clientName?.isNotEmpty == true)
-                                      t.clientName!,
-                                    if (t.clientPhone?.isNotEmpty == true)
-                                      t.clientPhone!,
-                                  ].join(' • '),
+                                  title,
                                   style: TextStyle(
-                                    fontSize: 12,
-                                    color: AppColors.textSecondary(context),
+                                    fontSize: 17,
+                                    fontWeight: t.unreadCount > 0
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                    color: CupertinoColors.label.resolveFrom(
+                                      context,
+                                    ),
                                   ),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                 ),
                               ),
+                              if (lastTs != null) ...[
+                                const SizedBox(width: 8),
+                                Text(
+                                  _formatTime(lastTs),
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    color: t.unreadCount > 0
+                                        ? CupertinoColors.activeBlue
+                                        : CupertinoColors.secondaryLabel
+                                              .resolveFrom(context),
+                                    fontWeight: t.unreadCount > 0
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                  ),
+                                ),
+                              ],
                             ],
                           ),
-                        ),
-                      if (lastText.isNotEmpty)
-                        Text(
-                          lastText,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: AppColors.textSecondary(context),
-                          ),
-                        ),
-                    ],
-                  ),
-                  trailing: PopupMenuButton<String>(
-                    icon: Icon(
-                      t.assignedUser != null ? Icons.person : Icons.person_off,
-                      size: 20,
-                      color: Theme.of(context).colorScheme.primary,
+                          const SizedBox(height: 2),
+                          if (lastText.isNotEmpty)
+                            Text(
+                              lastText,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 15,
+                                color: CupertinoColors.secondaryLabel
+                                    .resolveFrom(context),
+                              ),
+                            ),
+                          // Отображение назначенного оператора
+                          if (t.assignedUser != null) ...[
+                            const SizedBox(height: 4),
+                            Row(
+                              children: [
+                                Icon(
+                                  CupertinoIcons.person_circle_fill,
+                                  size: 14,
+                                  color: CupertinoColors.systemGreen
+                                      .resolveFrom(context),
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    t.assignedUser!.name ??
+                                        t.assignedUser!.email ??
+                                        'Оператор #${t.assignedUser!.id}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: CupertinoColors.systemGreen
+                                          .resolveFrom(context),
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
                     ),
-                    onSelected: (value) {
-                      switch (value) {
-                        case 'assign_me':
-                          _assignToMe(t);
-                          break;
-                        case 'unassign':
-                          _unassignTicket(t);
-                          break;
-                        case 'priority_low':
-                          _setPriority(t, 'low');
-                          break;
-                        case 'priority_normal':
-                          _setPriority(t, 'normal');
-                          break;
-                        case 'priority_high':
-                          _setPriority(t, 'high');
-                          break;
-                        case 'priority_urgent':
-                          _setPriority(t, 'urgent');
-                          break;
-                        case 'close':
-                          _closeTicket(t);
-                          break;
-                      }
-                    },
-                    itemBuilder: (_) => [
-                      const PopupMenuItem(
-                        value: 'assign_me',
-                        child: Text('Назначить мне'),
-                      ),
-                      const PopupMenuItem(
-                        value: 'unassign',
-                        child: Text('Снять назначение'),
-                      ),
-                      const PopupMenuDivider(),
-                      const PopupMenuItem(
-                        value: 'priority_low',
-                        child: Text('Приоритет: низкий'),
-                      ),
-                      const PopupMenuItem(
-                        value: 'priority_normal',
-                        child: Text('Приоритет: обычный'),
-                      ),
-                      const PopupMenuItem(
-                        value: 'priority_high',
-                        child: Text('Приоритет: высокий'),
-                      ),
-                      const PopupMenuItem(
-                        value: 'priority_urgent',
-                        child: Text('Приоритет: срочный'),
-                      ),
-                      const PopupMenuDivider(),
-                      const PopupMenuItem(
-                        value: 'close',
-                        child: Text('Закрыть тикет'),
-                      ),
-                    ],
-                  ),
+                  ],
                 ),
               ),
             ),
@@ -1241,243 +1327,5 @@ class _MyHomePageState extends State<MyHomePage> {
       // Другой год - показываем полную дату
       return '${local.day.toString().padLeft(2, '0')}.${local.month.toString().padLeft(2, '0')}.${local.year}';
     }
-  }
-
-  Widget _statusChip(String status) {
-    Color baseColor;
-    IconData icon;
-    String label;
-
-    switch (status) {
-      case 'new':
-        baseColor = Colors.blue;
-        icon = Icons.new_releases_outlined;
-        label = 'Новый';
-        break;
-      case 'open':
-        baseColor = Colors.green;
-        icon = Icons.check_circle_outline;
-        label = 'Открыт';
-        break;
-      case 'in_progress':
-        baseColor = Colors.cyan;
-        icon = Icons.autorenew;
-        label = 'В работе';
-        break;
-      case 'pending':
-        baseColor = Colors.orange;
-        icon = Icons.pending_outlined;
-        label = 'В ожидании';
-        break;
-      case 'resolved':
-        baseColor = Colors.lightGreen;
-        icon = Icons.done_all;
-        label = 'Решен';
-        break;
-      case 'closed':
-        baseColor = Colors.grey;
-        icon = Icons.cancel_outlined;
-        label = 'Закрыт';
-        break;
-      default:
-        baseColor = Colors.blue;
-        icon = Icons.info_outline;
-        label = status;
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: AppColors.statusBackground(context, baseColor),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 12, color: AppColors.statusText(context, baseColor)),
-          const SizedBox(width: 4),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w500,
-              color: AppColors.statusText(context, baseColor),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _priorityChip(String priority) {
-    Color baseColor;
-
-    switch (priority) {
-      case 'urgent':
-        baseColor = Colors.red;
-        break;
-      case 'high':
-        baseColor = Colors.orange;
-        break;
-      case 'normal':
-        baseColor = Colors.blue;
-        break;
-      case 'low':
-        baseColor = Colors.grey;
-        break;
-      default:
-        baseColor = Colors.grey;
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: AppColors.statusBackground(context, baseColor),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Text(
-        priority,
-        style: TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.w500,
-          color: AppColors.statusText(context, baseColor),
-        ),
-      ),
-    );
-  }
-}
-
-/// Виджет с вкладками для отображения переписки и деталей тикета
-class _TicketTabbedView extends StatefulWidget {
-  final ApiClient client;
-  final TicketDto ticket;
-
-  const _TicketTabbedView({required this.client, required this.ticket});
-
-  @override
-  State<_TicketTabbedView> createState() => _TicketTabbedViewState();
-}
-
-class _TicketTabbedViewState extends State<_TicketTabbedView>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabController;
-
-  @override
-  void initState() {
-    super.initState();
-    _tabController = TabController(length: 2, vsync: this);
-  }
-
-  @override
-  void dispose() {
-    _tabController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // Заголовок с информацией о тикете и клиенте
-        Container(
-          color: Theme.of(context).colorScheme.surface,
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Icon(
-                    Icons.confirmation_number,
-                    color: Theme.of(context).colorScheme.primary,
-                    size: 20,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'Тикет #${widget.ticket.ticketNumber}',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
-              if (widget.ticket.clientName != null ||
-                  widget.ticket.clientPhone != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Row(
-                    children: [
-                      Icon(
-                        Icons.person_outline,
-                        size: 16,
-                        color: AppColors.textTertiary(context),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text(
-                          [
-                            if (widget.ticket.clientName?.isNotEmpty == true)
-                              widget.ticket.clientName!,
-                            if (widget.ticket.clientPhone?.isNotEmpty == true)
-                              widget.ticket.clientPhone!,
-                          ].join(' • '),
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(
-                                color: AppColors.textSecondary(context),
-                              ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              if (widget.ticket.subject?.isNotEmpty == true)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    widget.ticket.subject!,
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: AppColors.textTertiary(context),
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                ),
-            ],
-          ),
-        ),
-        Container(
-          color: Theme.of(context).colorScheme.surface,
-          child: TabBar(
-            controller: _tabController,
-            labelColor: Theme.of(context).colorScheme.primary,
-            unselectedLabelColor: Colors.grey,
-            indicatorColor: Theme.of(context).colorScheme.primary,
-            tabs: const [
-              Tab(icon: Icon(Icons.chat_bubble_outline), text: 'Переписка'),
-              Tab(icon: Icon(Icons.info_outline), text: 'Детали'),
-            ],
-          ),
-        ),
-        Expanded(
-          child: TabBarView(
-            controller: _tabController,
-            children: [
-              // Вкладка с перепиской
-              TicketMessagesPage(
-                client: widget.client,
-                ticketNumber: widget.ticket.ticketNumber,
-                ticketSubject: widget.ticket.subject,
-                clientName: widget.ticket.clientName,
-                clientPhone: widget.ticket.clientPhone,
-                showAppBar: false,
-              ),
-              // Вкладка с деталями
-              TicketDetailPane(client: widget.client, ticket: widget.ticket),
-            ],
-          ),
-        ),
-      ],
-    );
   }
 }

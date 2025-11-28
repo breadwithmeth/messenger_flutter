@@ -66,7 +66,7 @@ class _TicketMessagesPageState extends State<TicketMessagesPage> {
 
   void _startPolling() {
     _poller?.cancel();
-    _poller = Timer.periodic(const Duration(seconds: 3), (_) async {
+    _poller = Timer.periodic(const Duration(seconds: 15), (_) async {
       if (!mounted) return;
       if (_loading || _sending) return;
       try {
