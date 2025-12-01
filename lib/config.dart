@@ -5,8 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 class AppConfig {
   static const String baseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'https://bm.drawbridge.kz',
-    //defaultValue: 'http://localhost:4000',
+    //defaultValue: 'https://bm.drawbridge.kz',
+    defaultValue: 'http://localhost:4000',
   );
 
   // Ollama настройки (загружаются асинхронно)

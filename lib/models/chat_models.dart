@@ -288,3 +288,63 @@ class MessagesResponse {
             .toList(),
       );
 }
+
+// Модель для параметров фильтрации чатов
+class ChatFilters {
+  final String? status; // open | pending | closed
+  final bool?
+  assigned; // true - только назначенные, false - неназначенные, null - все
+  final String? priority; // low | normal | high | urgent
+  final bool? includeProfile; // добавлять displayName из Chat.name
+  final bool? assignedToMe; // true - чаты назначенные текущему пользователю
+
+  ChatFilters({
+    this.status,
+    this.assigned,
+    this.priority,
+    this.includeProfile,
+    this.assignedToMe,
+  });
+
+  Map<String, dynamic> toQueryParams() {
+    final params = <String, dynamic>{};
+    if (status != null) params['status'] = status;
+    if (assigned != null) params['assigned'] = assigned.toString();
+    if (priority != null) params['priority'] = priority;
+    if (includeProfile != null)
+      params['includeProfile'] = includeProfile.toString();
+    if (assignedToMe != null) params['assignedToMe'] = assignedToMe.toString();
+    return params;
+  }
+
+  // Для сохранения в SharedPreferences
+  Map<String, dynamic> toJson() => {
+    'status': status,
+    'assigned': assigned,
+    'priority': priority,
+    'includeProfile': includeProfile,
+    'assignedToMe': assignedToMe,
+  };
+
+  factory ChatFilters.fromJson(Map<String, dynamic> json) => ChatFilters(
+    status: json['status'] as String?,
+    assigned: json['assigned'] as bool?,
+    priority: json['priority'] as String?,
+    includeProfile: json['includeProfile'] as bool?,
+    assignedToMe: json['assignedToMe'] as bool?,
+  );
+}
+
+// Модель для ответа профиля чата
+class ChatProfileResponse {
+  final String jid;
+  final String? photoUrl;
+
+  ChatProfileResponse({required this.jid, this.photoUrl});
+
+  factory ChatProfileResponse.fromJson(Map<String, dynamic> json) =>
+      ChatProfileResponse(
+        jid: json['jid'] as String,
+        photoUrl: json['photoUrl'] as String?,
+      );
+}

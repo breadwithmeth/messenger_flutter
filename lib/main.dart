@@ -12,14 +12,18 @@ import 'screens/organizations_page.dart';
 import 'screens/users_page.dart';
 import 'screens/phones_page.dart';
 import 'screens/unread_page.dart';
+import 'screens/assigned_chats_page.dart';
 import 'screens/messages_page.dart';
 import 'screens/wa_page.dart';
 import 'screens/telegram_bots_page.dart';
 import 'screens/settings_page.dart';
+import 'screens/chat_filters_page.dart';
 import 'models/auth_models.dart';
 import 'theme_provider.dart';
 import 'theme_colors.dart';
 import 'dart:async';
+import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const MyApp());
@@ -167,12 +171,14 @@ class _MyHomePageState extends State<MyHomePage> {
   late final ChatsService _chats;
   late final UnreadService _unread;
   List<ChatDto> _items = [];
+  List<ChatDto> _assignedItems = [];
   bool _loading = false;
   String? _error;
   UserDto? _me;
   ChatDto? _selectedChat;
   bool _loadingSelectedChat = false;
   Timer? _poller;
+  ChatFilters _currentFilters = ChatFilters(includeProfile: true);
 
   @override
   void initState() {
@@ -181,6 +187,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _auth = AuthService(_client);
     _chats = ChatsService(_client);
     _unread = UnreadService(_client);
+    _loadSavedFilters();
     _bootstrap();
     _startPolling();
   }
@@ -198,8 +205,20 @@ class _MyHomePageState extends State<MyHomePage> {
         WidgetsBinding.instance.addPostFrameCallback((_) => _openLogin());
         return;
       }
-      // Получим текущего пользователя для operatorId при назначении
-      _me = await _auth.me();
+
+      // Токен есть, пробуем получить данные пользователя
+      try {
+        _me = await _auth.me();
+      } catch (e) {
+        // Если токен невалидный, очищаем и показываем логин
+        print('Token invalid, clearing: $e');
+        await _client.clearToken();
+        setState(() => _loading = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) => _openLogin());
+        return;
+      }
+
+      // Получаем чаты только после успешной аутентификации
       await _loadChats();
     } catch (e) {
       setState(() => _error = '$e');
@@ -210,12 +229,26 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _loadChats() async {
     final resp = await _chats.listChats(
+      filters: _currentFilters,
       sortBy: 'lastMessageAt',
       sortOrder: 'desc',
     );
+
+    // Загружаем только чаты, назначенные текущему пользователю
+    List<ChatDto> assignedToMe = [];
+    if (_me != null) {
+      final assignedResp = await _chats.listChats(
+        filters: ChatFilters(assignedToMe: true, includeProfile: true),
+        sortBy: 'lastMessageAt',
+        sortOrder: 'desc',
+      );
+      assignedToMe = assignedResp.chats;
+    }
+
     setState(() {
       // Сервер уже вернул отсортированные чаты
       _items = resp.chats;
+      _assignedItems = assignedToMe;
 
       if (_selectedChat != null) {
         final selId = _selectedChat!.id;
@@ -315,9 +348,29 @@ class _MyHomePageState extends State<MyHomePage> {
     final success = await Navigator.of(
       context,
     ).push<bool>(MaterialPageRoute(builder: (_) => LoginPage(auth: _auth)));
+
     if (success == true) {
-      _me = await _auth.me();
-      await _loadChats();
+      // Ждем пока токен точно сохранится
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      setState(() => _loading = true);
+      try {
+        // Сначала получаем информацию о пользователе
+        _me = await _auth.me();
+        // Только после успешного получения данных пользователя загружаем чаты
+        await _loadChats();
+      } catch (e) {
+        if (mounted) {
+          setState(() => _error = 'Ошибка после входа: $e');
+          // Если что-то пошло не так, очищаем токен и показываем логин снова
+          await _client.clearToken();
+          WidgetsBinding.instance.addPostFrameCallback((_) => _openLogin());
+        }
+      } finally {
+        if (mounted) {
+          setState(() => _loading = false);
+        }
+      }
     }
   }
 
@@ -359,28 +412,28 @@ class _MyHomePageState extends State<MyHomePage> {
           children: [
             CupertinoButton(
               padding: EdgeInsets.zero,
-              onPressed: _showNewChatDialog,
-              child: const Icon(
-                CupertinoIcons.plus_circle_fill,
-                color: CupertinoColors.activeBlue,
-                size: 28,
+              onPressed: _openFiltersPage,
+              child: Icon(
+                CupertinoIcons.slider_horizontal_3,
+                color: _hasActiveFilters()
+                    ? CupertinoColors.activeBlue
+                    : CupertinoColors.systemGrey,
+                size: 26,
               ),
             ),
             CupertinoButton(
               padding: EdgeInsets.zero,
-              onPressed: _markAllAsRead,
-              child: Icon(
-                CupertinoIcons.checkmark_alt_circle_fill,
-                color: _items.any((c) => c.unreadCount > 0)
-                    ? CupertinoColors.activeBlue
-                    : CupertinoColors.systemGrey,
-                size: 28,
+              onPressed: _showNewChatDialog,
+              child: const Icon(
+                CupertinoIcons.plus_circle_fill,
+                color: CupertinoColors.activeBlue,
+                size: 26,
               ),
             ),
             CupertinoButton(
               padding: EdgeInsets.zero,
               onPressed: _loadChats,
-              child: const Icon(CupertinoIcons.refresh, size: 28),
+              child: const Icon(CupertinoIcons.refresh, size: 26),
             ),
           ],
         ),
@@ -535,6 +588,32 @@ class _MyHomePageState extends State<MyHomePage> {
                   );
                 },
               ),
+              // Назначенные чаты
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.person_crop_circle_fill_badge_checkmark,
+                  color: CupertinoColors.systemGreen.resolveFrom(context),
+                ),
+                title: Text(
+                  'Назначенные чаты',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(
+                    CupertinoPageRoute(
+                      builder: (_) => AssignedChatsPage(client: _client),
+                    ),
+                  );
+                },
+              ),
               // WA сессия
               CupertinoListTile(
                 leading: Icon(
@@ -587,6 +666,36 @@ class _MyHomePageState extends State<MyHomePage> {
                       ),
                     ),
                   );
+                },
+              ),
+              // Разделитель
+              Container(
+                height: 0.5,
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                color: CupertinoColors.separator.resolveFrom(context),
+              ),
+              // Пометить все как прочитанные
+              CupertinoListTile(
+                leading: Icon(
+                  CupertinoIcons.checkmark_alt_circle_fill,
+                  color: _items.any((c) => c.unreadCount > 0)
+                      ? CupertinoColors.activeBlue.resolveFrom(context)
+                      : CupertinoColors.systemGrey.resolveFrom(context),
+                ),
+                title: Text(
+                  'Пометить все как прочитанные',
+                  style: TextStyle(
+                    color: CupertinoColors.label.resolveFrom(context),
+                  ),
+                ),
+                trailing: Icon(
+                  CupertinoIcons.chevron_forward,
+                  color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  size: 20,
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _markAllAsRead();
                 },
               ),
               // Разделитель
@@ -682,6 +791,43 @@ class _MyHomePageState extends State<MyHomePage> {
           ? const Center(child: CircularProgressIndicator())
           : _buildBody(),
     );
+  }
+
+  Future<void> _loadSavedFilters() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final filtersJson = prefs.getString('chat_filters');
+      if (filtersJson != null) {
+        final decoded = jsonDecode(filtersJson) as Map<String, dynamic>;
+        setState(() {
+          _currentFilters = ChatFilters.fromJson(decoded);
+        });
+      }
+    } catch (e) {
+      // Игнорируем ошибки загрузки фильтров
+      print('Error loading filters: $e');
+    }
+  }
+
+  bool _hasActiveFilters() {
+    return _currentFilters.status != null ||
+        _currentFilters.assigned != null ||
+        _currentFilters.priority != null;
+  }
+
+  Future<void> _openFiltersPage() async {
+    final result = await Navigator.of(context).push(
+      CupertinoPageRoute(
+        builder: (context) => ChatFiltersPage(initialFilters: _currentFilters),
+      ),
+    );
+
+    if (result != null && result is ChatFilters) {
+      setState(() {
+        _currentFilters = result;
+      });
+      await _loadChats();
+    }
   }
 
   Future<void> _showNewChatDialog() async {
@@ -924,7 +1070,7 @@ class _MyHomePageState extends State<MyHomePage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isWide = constraints.maxWidth >= 900;
-        if (_items.isEmpty) {
+        if (_items.isEmpty && _assignedItems.isEmpty) {
           return Center(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -956,11 +1102,104 @@ class _MyHomePageState extends State<MyHomePage> {
         }
 
         if (!isWide) {
-          return _buildChatList(isWide: false);
+          return _buildChatList(isWide: false, items: _items);
         }
 
         return Row(
           children: [
+            // Колонка назначенных чатов
+            Container(
+              width: 320,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerLow,
+                border: Border(
+                  right: BorderSide(
+                    color: Theme.of(
+                      context,
+                    ).dividerColor.withValues(alpha: 0.1),
+                  ),
+                ),
+              ),
+              child: Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: CupertinoColors.systemGreen
+                          .resolveFrom(context)
+                          .withOpacity(0.1),
+                      border: Border(
+                        bottom: BorderSide(
+                          color: CupertinoColors.separator.resolveFrom(context),
+                          width: 0.5,
+                        ),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          CupertinoIcons
+                              .person_crop_circle_fill_badge_checkmark,
+                          color: CupertinoColors.systemGreen.resolveFrom(
+                            context,
+                          ),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Назначенные',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: CupertinoColors.label.resolveFrom(context),
+                          ),
+                        ),
+                        const Spacer(),
+                        if (_assignedItems.isNotEmpty)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: CupertinoColors.systemGreen.resolveFrom(
+                                context,
+                              ),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              '${_assignedItems.length}',
+                              style: const TextStyle(
+                                color: CupertinoColors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: _assignedItems.isEmpty
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Text(
+                                'Нет назначенных чатов',
+                                style: TextStyle(
+                                  color: AppColors.textTertiary(context),
+                                  fontSize: 14,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          )
+                        : _buildChatList(isWide: true, items: _assignedItems),
+                  ),
+                ],
+              ),
+            ),
+            // Колонка всех чатов
             Container(
               width: 360,
               decoration: BoxDecoration(
@@ -974,9 +1213,67 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
               child: Column(
-                children: [Expanded(child: _buildChatList(isWide: true))],
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      border: Border(
+                        bottom: BorderSide(
+                          color: CupertinoColors.separator.resolveFrom(context),
+                          width: 0.5,
+                        ),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          CupertinoIcons.chat_bubble_2_fill,
+                          color: CupertinoColors.activeBlue.resolveFrom(
+                            context,
+                          ),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Все чаты',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: CupertinoColors.label.resolveFrom(context),
+                          ),
+                        ),
+                        const Spacer(),
+                        if (_items.isNotEmpty)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: CupertinoColors.systemGrey4.resolveFrom(
+                                context,
+                              ),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              '${_items.length}',
+                              style: TextStyle(
+                                color: CupertinoColors.label.resolveFrom(
+                                  context,
+                                ),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Expanded(child: _buildChatList(isWide: true, items: _items)),
+                ],
               ),
             ),
+            // Панель сообщений
             Expanded(
               child: _selectedChat == null
                   ? Center(
@@ -1043,12 +1340,12 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildChatList({required bool isWide}) {
+  Widget _buildChatList({required bool isWide, required List<ChatDto> items}) {
     return ListView.builder(
       padding: const EdgeInsets.symmetric(vertical: 8),
-      itemCount: _items.length,
+      itemCount: items.length,
       itemBuilder: (_, i) {
-        final t = _items[i];
+        final t = items[i];
         final title = t.displayName; // Используем новый геттер
         final lastTs = t.lastMessage?.timestamp;
         final lastText = t.lastMessage?.content ?? '';

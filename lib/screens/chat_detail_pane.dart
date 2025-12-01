@@ -89,6 +89,11 @@ class _ChatDetailPaneState extends State<ChatDetailPane> {
 
   String _absUrl(String url) {
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
+    // Если URL начинается с /media/, проверяем, может это R2 хранилище
+    if (url.startsWith('/media/')) {
+      // Возвращаем полный URL с R2 хранилища
+      return 'https://r2.drawbridge.kz$url';
+    }
     final base = AppConfig.baseUrl.endsWith('/')
         ? AppConfig.baseUrl.substring(0, AppConfig.baseUrl.length - 1)
         : AppConfig.baseUrl;

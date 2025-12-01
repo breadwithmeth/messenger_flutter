@@ -94,6 +94,18 @@ class ApiClient {
 
   // Получение байтов по абсолютному или относительному URL (с учётом baseUrl)
   Future<Uint8List> getBytes(String urlOrPath) async {
+    // Если это полный URL (не относительный путь), используем отдельный Dio без авторизации
+    if (urlOrPath.startsWith('http://') || urlOrPath.startsWith('https://')) {
+      final publicDio = Dio();
+      final resp = await publicDio.get<List<int>>(
+        urlOrPath,
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final data = resp.data ?? const <int>[];
+      return Uint8List.fromList(data);
+    }
+
+    // Для относительных путей используем обычный Dio с авторизацией
     final resp = await _dio.get<List<int>>(
       urlOrPath,
       options: Options(responseType: ResponseType.bytes),

@@ -6,23 +6,23 @@ class ChatsService {
   ChatsService(this._client);
 
   Future<ChatsListResponse> listChats({
-    String? status, // open | pending | closed
-    String? assigned, // 'true' | 'false'
-    String? priority, // low | normal | high | urgent
+    ChatFilters? filters,
     String?
     sortBy, // lastMessageAt | createdAt | priority | unreadCount | ticketNumber | status | name
     String? sortOrder, // desc | asc
   }) async {
-    final res = await _client.get(
-      '/api/chats',
-      query: {
-        if (status != null) 'status': status,
-        if (assigned != null) 'assigned': assigned,
-        if (priority != null) 'priority': priority,
-        if (sortBy != null) 'sortBy': sortBy,
-        if (sortOrder != null) 'sortOrder': sortOrder,
-      },
-    );
+    final query = <String, dynamic>{};
+
+    // Добавляем параметры из фильтров
+    if (filters != null) {
+      query.addAll(filters.toQueryParams());
+    }
+
+    // Добавляем параметры сортировки
+    if (sortBy != null) query['sortBy'] = sortBy;
+    if (sortOrder != null) query['sortOrder'] = sortOrder;
+
+    final res = await _client.get('/api/chats', query: query);
     return ChatsListResponse.fromJson(res.data as Map<String, dynamic>);
   }
 
@@ -45,5 +45,38 @@ class ChatsService {
   Future<List<dynamic>> getOperators() async {
     final res = await _client.get('/api/users/all');
     return res.data as List<dynamic>;
+  }
+
+  Future<ChatProfileResponse> getChatProfile({
+    required String remoteJid,
+    required int organizationPhoneId,
+  }) async {
+    final res = await _client.get(
+      '/api/chats/$remoteJid/profile',
+      query: {'organizationPhoneId': organizationPhoneId.toString()},
+    );
+    return ChatProfileResponse.fromJson(res.data as Map<String, dynamic>);
+  }
+
+  Future<Map<String, dynamic>> changePriority({
+    required int chatId,
+    required String priority,
+  }) async {
+    final res = await _client.postJson(
+      '/api/chat-assignment/priority',
+      data: {'chatId': chatId, 'priority': priority},
+    );
+    return res.data as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> closeChat({
+    required int chatId,
+    String? reason,
+  }) async {
+    final res = await _client.postJson(
+      '/api/chat-assignment/close',
+      data: {'chatId': chatId, if (reason != null) 'reason': reason},
+    );
+    return res.data as Map<String, dynamic>;
   }
 }

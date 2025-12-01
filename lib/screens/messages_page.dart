@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:messenger_flutter/api/api_client.dart';
 import 'package:messenger_flutter/api/chats_service.dart';
 import 'package:messenger_flutter/api/messages_service.dart';
@@ -9,6 +11,7 @@ import 'package:messenger_flutter/api/accounts_service.dart';
 import 'package:messenger_flutter/api/unread_service.dart';
 import 'package:messenger_flutter/api/telegram_bots_service.dart';
 import 'package:messenger_flutter/api/auth_service.dart';
+import 'package:messenger_flutter/api/chat_assignment_service.dart';
 import 'package:messenger_flutter/models/auth_models.dart';
 import 'package:messenger_flutter/models/chat_models.dart';
 import 'package:messenger_flutter/config.dart';
@@ -47,12 +50,14 @@ class _MessagesPageState extends State<MessagesPage> {
   late final UnreadService _unread;
   late final TelegramBotsService _telegramBots;
   late final AuthService _auth;
+  late final ChatAssignmentService _chatAssignment;
   final _textCtrl = TextEditingController();
   UserDto? _me;
   final _scrollCtrl = ScrollController();
   final _jidCtrl = TextEditingController();
   List<MessageDto> _items = [];
   bool _loading = false;
+  bool _sending = false;
   String? _error;
   List<dynamic> _orgPhones = [];
   int? _selectedPhoneId;
@@ -73,6 +78,7 @@ class _MessagesPageState extends State<MessagesPage> {
     _unread = UnreadService(widget.client);
     _telegramBots = TelegramBotsService(widget.client);
     _auth = AuthService(widget.client);
+    _chatAssignment = ChatAssignmentService(widget.client);
     _loadCurrentUser();
 
     // Если чат передан напрямую, используем его
@@ -108,6 +114,11 @@ class _MessagesPageState extends State<MessagesPage> {
 
   String _absUrl(String url) {
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
+    // Если URL начинается с /media/, проверяем, может это R2 хранилище
+    if (url.startsWith('/media/')) {
+      // Возвращаем полный URL с R2 хранилища
+      return 'https://r2.drawbridge.kz$url';
+    }
     final base = AppConfig.baseUrl.endsWith('/')
         ? AppConfig.baseUrl.substring(0, AppConfig.baseUrl.length - 1)
         : AppConfig.baseUrl;
@@ -300,6 +311,65 @@ class _MessagesPageState extends State<MessagesPage> {
     }
   }
 
+  Future<void> _unassignChat() async {
+    if (widget.chatId == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Нельзя снять назначение с нового чата.'),
+          backgroundColor: CupertinoColors.destructiveRed,
+        ),
+      );
+      return;
+    }
+
+    // Показываем диалог подтверждения
+    final confirmed = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('Снять назначение'),
+        content: const Text(
+          'Вы уверены, что хотите снять назначение с этого чата?',
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Снять назначение'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    try {
+      await _chatAssignment.unassign(chatId: widget.chatId);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Назначение снято'),
+            backgroundColor: CupertinoColors.systemGreen,
+          ),
+        );
+        // Обновляем информацию о чате
+        await _loadChatInfo();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка снятия назначения: $e'),
+            backgroundColor: CupertinoColors.destructiveRed,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _assignChatToOperator() async {
     if (widget.chatId == 0) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -367,6 +437,160 @@ class _MessagesPageState extends State<MessagesPage> {
         ],
       ),
     );
+  }
+
+  Future<void> _changePriority() async {
+    if (widget.chatId == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Нельзя изменить приоритет нового чата'),
+          backgroundColor: CupertinoColors.destructiveRed,
+        ),
+      );
+      return;
+    }
+
+    final priorities = ['low', 'normal', 'high', 'urgent'];
+    final priorityLabels = {
+      'low': 'Низкий',
+      'normal': 'Обычный',
+      'high': 'Высокий',
+      'urgent': 'Срочный',
+    };
+
+    if (!mounted) return;
+
+    showCupertinoDialog(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('Изменить приоритет'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 12),
+            ...priorities.map((priority) {
+              return CupertinoDialogAction(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  try {
+                    final result = await _chats.changePriority(
+                      chatId: widget.chatId,
+                      priority: priority,
+                    );
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            result['message'] ??
+                                'Приоритет изменен на ${priorityLabels[priority]}',
+                          ),
+                          backgroundColor: CupertinoColors.systemGreen,
+                        ),
+                      );
+                      // Обновляем информацию о чате
+                      _loadChatInfo();
+                    }
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Ошибка изменения приоритета: $e'),
+                          backgroundColor: CupertinoColors.destructiveRed,
+                        ),
+                      );
+                    }
+                  }
+                },
+                child: Text(priorityLabels[priority]!),
+              );
+            }).toList(),
+          ],
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _closeChat() async {
+    if (widget.chatId == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Нельзя закрыть новый чат'),
+          backgroundColor: CupertinoColors.destructiveRed,
+        ),
+      );
+      return;
+    }
+
+    final reasonCtrl = TextEditingController();
+
+    if (!mounted) return;
+
+    final confirm = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('Закрыть чат?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 12),
+            const Text('Чат будет помечен как закрытый'),
+            const SizedBox(height: 12),
+            CupertinoTextField(
+              controller: reasonCtrl,
+              placeholder: 'Причина закрытия (необязательно)',
+              maxLines: 3,
+              padding: const EdgeInsets.all(12),
+            ),
+          ],
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Закрыть чат'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final result = await _chats.closeChat(
+        chatId: widget.chatId,
+        reason: reasonCtrl.text.trim().isEmpty ? null : reasonCtrl.text.trim(),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result['message'] ?? 'Чат закрыт'),
+            backgroundColor: CupertinoColors.systemGreen,
+          ),
+        );
+        // Обновляем информацию о чате
+        _loadChatInfo();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка закрытия чата: $e'),
+            backgroundColor: CupertinoColors.destructiveRed,
+          ),
+        );
+      }
+    }
   }
 
   /// Удаляет теги <think>...</think> из текста
@@ -464,7 +688,7 @@ class _MessagesPageState extends State<MessagesPage> {
     final text = _textCtrl.text.trim();
     if (text.isEmpty) return;
 
-    setState(() => _loading = true);
+    setState(() => _sending = true);
     try {
       // Проверяем тип чата
       print('DEBUG: Sending message, _currentChat: ${_currentChat?.channel}');
@@ -514,7 +738,7 @@ class _MessagesPageState extends State<MessagesPage> {
       print('DEBUG: Error sending message: $e');
       setState(() => _error = '$e');
     } finally {
-      setState(() => _loading = false);
+      setState(() => _sending = false);
     }
   }
 
@@ -522,26 +746,126 @@ class _MessagesPageState extends State<MessagesPage> {
     final picker = ImagePicker();
     final picked = await picker.pickImage(source: ImageSource.gallery);
     if (picked == null) return;
-    setState(() => _loading = true);
+
     try {
       final bytes = await picked.readAsBytes();
       final fileName = picked.name.isNotEmpty ? picked.name : 'upload.jpg';
-      final part = MultipartFile.fromBytes(bytes, filename: fileName);
-      final caption = _textCtrl.text.trim().isNotEmpty
-          ? _textCtrl.text.trim()
-          : null;
-      await _media.uploadAndSend(
-        mediaPart: part,
-        chatId: widget.chatId,
-        mediaType: 'image',
-        caption: caption,
-      );
-      if (caption != null) _textCtrl.clear();
-      await _load();
+      await _showImagePreview(bytes, fileName);
     } catch (e) {
       setState(() => _error = '$e');
-    } finally {
-      setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _sendDocument() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+      withData: true,
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    final file = result.files.first;
+    if (file.bytes == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Не удалось прочитать файл'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    await _showDocumentPreview(file.bytes!, file.name);
+  }
+
+  Future<void> _showDocumentPreview(Uint8List bytes, String fileName) async {
+    if (!mounted) return;
+
+    final shouldSend = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        title: const Text('Отправить документ?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 16),
+            const Icon(
+              CupertinoIcons.doc_fill,
+              size: 64,
+              color: CupertinoColors.systemRed,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              fileName,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '${(bytes.length / 1024).toStringAsFixed(1)} KB',
+              style: const TextStyle(
+                fontSize: 12,
+                color: CupertinoColors.systemGrey,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Отправить'),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldSend == true && mounted) {
+      setState(() => _sending = true);
+      try {
+        await _uploadAndSendDocument(bytes, fileName);
+      } finally {
+        if (mounted) {
+          setState(() => _sending = false);
+        }
+      }
+    }
+  }
+
+  Future<void> _uploadAndSendDocument(Uint8List bytes, String fileName) async {
+    final part = MultipartFile.fromBytes(bytes, filename: fileName);
+
+    final caption = _textCtrl.text.trim().isNotEmpty
+        ? _textCtrl.text.trim()
+        : null;
+
+    await _media.uploadAndSend(
+      mediaPart: part,
+      chatId: widget.chatId,
+      mediaType: 'document',
+      caption: caption,
+    );
+
+    if (caption != null) _textCtrl.clear();
+    await _load();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Документ отправлен'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -565,7 +889,6 @@ class _MessagesPageState extends State<MessagesPage> {
       for (var item in reader.items) {
         // Пробуем получить изображение PNG
         if (item.canProvide(Formats.png)) {
-          setState(() => _loading = true);
           try {
             item.getFile(Formats.png, (file) async {
               try {
@@ -574,7 +897,7 @@ class _MessagesPageState extends State<MessagesPage> {
                 final imageBytes = Uint8List.fromList(
                   bytes.expand((x) => x).toList(),
                 );
-                await _uploadAndSendImage(imageBytes, 'pasted_image.png');
+                await _showImagePreview(imageBytes, 'pasted_image.png');
               } catch (e) {
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -584,27 +907,23 @@ class _MessagesPageState extends State<MessagesPage> {
                     ),
                   );
                 }
-              } finally {
-                setState(() => _loading = false);
               }
             });
           } catch (e) {
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
-                  content: Text('Ошибка при отправке изображения: $e'),
+                  content: Text('Ошибка при обработке изображения: $e'),
                   backgroundColor: Colors.red,
                 ),
               );
             }
-            setState(() => _loading = false);
           }
           return;
         }
 
         // Пробуем получить изображение JPEG
         if (item.canProvide(Formats.jpeg)) {
-          setState(() => _loading = true);
           try {
             item.getFile(Formats.jpeg, (file) async {
               try {
@@ -613,7 +932,7 @@ class _MessagesPageState extends State<MessagesPage> {
                 final imageBytes = Uint8List.fromList(
                   bytes.expand((x) => x).toList(),
                 );
-                await _uploadAndSendImage(imageBytes, 'pasted_image.jpg');
+                await _showImagePreview(imageBytes, 'pasted_image.jpg');
               } catch (e) {
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -623,27 +942,23 @@ class _MessagesPageState extends State<MessagesPage> {
                     ),
                   );
                 }
-              } finally {
-                setState(() => _loading = false);
               }
             });
           } catch (e) {
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
-                  content: Text('Ошибка при отправке изображения: $e'),
+                  content: Text('Ошибка при обработке изображения: $e'),
                   backgroundColor: Colors.red,
                 ),
               );
             }
-            setState(() => _loading = false);
           }
           return;
         }
 
         // Пробуем получить изображение GIF
         if (item.canProvide(Formats.gif)) {
-          setState(() => _loading = true);
           try {
             item.getFile(Formats.gif, (file) async {
               try {
@@ -652,7 +967,7 @@ class _MessagesPageState extends State<MessagesPage> {
                 final imageBytes = Uint8List.fromList(
                   bytes.expand((x) => x).toList(),
                 );
-                await _uploadAndSendImage(imageBytes, 'pasted_image.gif');
+                await _showImagePreview(imageBytes, 'pasted_image.gif');
               } catch (e) {
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -662,20 +977,17 @@ class _MessagesPageState extends State<MessagesPage> {
                     ),
                   );
                 }
-              } finally {
-                setState(() => _loading = false);
               }
             });
           } catch (e) {
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
-                  content: Text('Ошибка при отправке изображения: $e'),
+                  content: Text('Ошибка при обработке изображения: $e'),
                   backgroundColor: Colors.red,
                 ),
               );
             }
-            setState(() => _loading = false);
           }
           return;
         }
@@ -706,6 +1018,83 @@ class _MessagesPageState extends State<MessagesPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Ошибка доступа к буферу обмена: $e')),
         );
+      }
+    }
+  }
+
+  // Показывает превью изображения перед отправкой
+  Future<void> _showImagePreview(Uint8List bytes, String fileName) async {
+    if (!mounted) return;
+
+    final shouldSend = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) {
+        final screenHeight = MediaQuery.of(context).size.height;
+        final screenWidth = MediaQuery.of(context).size.width;
+        final maxImageHeight = screenHeight * 0.5; // 50% высоты экрана
+        final maxImageWidth = screenWidth * 0.7; // 70% ширины экрана
+
+        return CupertinoAlertDialog(
+          title: const Text('Отправить изображение?'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 12),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: maxImageWidth,
+                      maxHeight: maxImageHeight,
+                    ),
+                    child: Image.memory(bytes, fit: BoxFit.contain),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  fileName,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: CupertinoColors.systemGrey,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${(bytes.length / 1024).toStringAsFixed(1)} KB',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: CupertinoColors.systemGrey,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            CupertinoDialogAction(
+              isDestructiveAction: true,
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Отмена'),
+            ),
+            CupertinoDialogAction(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Отправить'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (shouldSend == true && mounted) {
+      setState(() => _sending = true);
+      try {
+        await _uploadAndSendImage(bytes, fileName);
+      } finally {
+        if (mounted) {
+          setState(() => _sending = false);
+        }
       }
     }
   }
@@ -868,29 +1257,92 @@ class _MessagesPageState extends State<MessagesPage> {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Tooltip(
-              message: 'Назначить мне',
-              child: CupertinoButton(
-                padding: EdgeInsets.zero,
-                onPressed: _assignChatToMe,
-                child: Icon(
-                  CupertinoIcons.person_fill,
-                  color: CupertinoColors.systemGreen.resolveFrom(context),
-                  size: 28,
-                ),
+            // Быстрая кнопка "Назначить мне"
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _assignChatToMe,
+              child: const Icon(
+                CupertinoIcons.person_fill,
+                color: CupertinoColors.activeBlue,
+                size: 28,
               ),
             ),
             const SizedBox(width: 8),
-            Tooltip(
-              message: 'Назначить оператору',
-              child: CupertinoButton(
-                padding: EdgeInsets.zero,
-                onPressed: _assignChatToOperator,
-                child: Icon(
-                  CupertinoIcons.person_2_fill,
-                  color: CupertinoColors.activeBlue.resolveFrom(context),
-                  size: 28,
-                ),
+            // Быстрая кнопка "Снять назначение"
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _unassignChat,
+              child: const Icon(
+                CupertinoIcons.person_badge_minus,
+                color: CupertinoColors.systemOrange,
+                size: 28,
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Меню с дополнительными действиями
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: () {
+                showCupertinoModalPopup(
+                  context: context,
+                  builder: (context) => CupertinoActionSheet(
+                    title: const Text('Действия с чатом'),
+                    actions: [
+                      CupertinoActionSheetAction(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _assignChatToOperator();
+                        },
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(CupertinoIcons.person_2_fill, size: 20),
+                            SizedBox(width: 8),
+                            Text('Назначить оператору'),
+                          ],
+                        ),
+                      ),
+                      CupertinoActionSheetAction(
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _changePriority();
+                        },
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(CupertinoIcons.flag_fill, size: 20),
+                            SizedBox(width: 8),
+                            Text('Изменить приоритет'),
+                          ],
+                        ),
+                      ),
+                      CupertinoActionSheetAction(
+                        isDestructiveAction: true,
+                        onPressed: () {
+                          Navigator.pop(context);
+                          _closeChat();
+                        },
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(CupertinoIcons.lock_fill, size: 20),
+                            SizedBox(width: 8),
+                            Text('Закрыть чат'),
+                          ],
+                        ),
+                      ),
+                    ],
+                    cancelButton: CupertinoActionSheetAction(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Отмена'),
+                    ),
+                  ),
+                );
+              },
+              child: const Icon(
+                CupertinoIcons.ellipsis_circle_fill,
+                color: CupertinoColors.activeBlue,
+                size: 28,
               ),
             ),
             const SizedBox(width: 8),
@@ -1009,160 +1461,171 @@ class _MessagesPageState extends State<MessagesPage> {
                                 ),
                               ),
                             ],
-                            GestureDetector(
-                              onLongPress: () {
-                                if (m.content.isNotEmpty) {
-                                  showDialog(
-                                    context: context,
-                                    builder: (context) => AlertDialog(
-                                      title: const Text('Действия'),
-                                      content: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          ListTile(
-                                            leading: const Icon(Icons.copy),
-                                            title: const Text(
-                                              'Копировать текст',
+                            Flexible(
+                              child: GestureDetector(
+                                onLongPress: () {
+                                  if (m.content.isNotEmpty) {
+                                    showDialog(
+                                      context: context,
+                                      builder: (context) => AlertDialog(
+                                        title: const Text('Действия'),
+                                        content: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            ListTile(
+                                              leading: const Icon(Icons.copy),
+                                              title: const Text(
+                                                'Копировать текст',
+                                              ),
+                                              onTap: () {
+                                                Clipboard.setData(
+                                                  ClipboardData(
+                                                    text: m.content,
+                                                  ),
+                                                );
+                                                Navigator.pop(context);
+                                                ScaffoldMessenger.of(
+                                                  context,
+                                                ).showSnackBar(
+                                                  const SnackBar(
+                                                    content: Text(
+                                                      'Текст скопирован',
+                                                    ),
+                                                    duration: Duration(
+                                                      seconds: 1,
+                                                    ),
+                                                  ),
+                                                );
+                                              },
                                             ),
-                                            onTap: () {
-                                              Clipboard.setData(
-                                                ClipboardData(text: m.content),
-                                              );
-                                              Navigator.pop(context);
-                                              ScaffoldMessenger.of(
-                                                context,
-                                              ).showSnackBar(
-                                                const SnackBar(
-                                                  content: Text(
-                                                    'Текст скопирован',
-                                                  ),
-                                                  duration: Duration(
-                                                    seconds: 1,
-                                                  ),
-                                                ),
-                                              );
-                                            },
+                                          ],
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context),
+                                            child: const Text('Закрыть'),
                                           ),
                                         ],
                                       ),
-                                      actions: [
-                                        TextButton(
-                                          onPressed: () =>
-                                              Navigator.pop(context),
-                                          child: const Text('Закрыть'),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                }
-                              },
-                              child: Container(
-                                constraints: BoxConstraints(
-                                  maxWidth:
-                                      MediaQuery.of(context).size.width * 0.7,
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 12,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: isMine
-                                      ? CupertinoColors.activeBlue.resolveFrom(
-                                          context,
-                                        )
-                                      : CupertinoColors.systemGrey5.resolveFrom(
-                                          context,
-                                        ),
-                                  borderRadius: BorderRadius.only(
-                                    topLeft: const Radius.circular(20),
-                                    topRight: const Radius.circular(20),
-                                    bottomLeft: isMine
-                                        ? const Radius.circular(20)
-                                        : const Radius.circular(4),
-                                    bottomRight: isMine
-                                        ? const Radius.circular(4)
-                                        : const Radius.circular(20),
+                                    );
+                                  }
+                                },
+                                child: Container(
+                                  constraints: BoxConstraints(
+                                    maxWidth:
+                                        MediaQuery.of(context).size.width * 0.7,
                                   ),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    if (m.senderJid != null || isMine)
-                                      Padding(
-                                        padding: const EdgeInsets.only(
-                                          bottom: 6.0,
-                                        ),
-                                        child: Text(
-                                          isMine
-                                              ? (m.senderUser?.name ??
-                                                    m.senderUser?.email ??
-                                                    'Оператор')
-                                              : (m.senderJid ?? 'Клиент'),
-                                          style: TextStyle(
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.w600,
-                                            color: isMine
-                                                ? CupertinoColors.white
-                                                : CupertinoColors.activeBlue,
-                                          ),
-                                        ),
-                                      ),
-                                    if (m.mediaUrl != null &&
-                                        m.mediaUrl!.isNotEmpty)
-                                      Padding(
-                                        padding: const EdgeInsets.only(
-                                          bottom: 8.0,
-                                        ),
-                                        child: _buildMediaWidget(m),
-                                      ),
-                                    if (m.content.isNotEmpty)
-                                      SelectableText(
-                                        m.content,
-                                        style: TextStyle(
-                                          fontSize: 15,
-                                          height: 1.4,
-                                          color: isMine
-                                              ? CupertinoColors.white
-                                              : CupertinoColors.label
-                                                    .resolveFrom(context),
-                                          fontWeight: FontWeight.w400,
-                                        ),
-                                      ),
-                                    const SizedBox(height: 6),
-                                    Row(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 12,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isMine
+                                        ? CupertinoColors.activeBlue
+                                              .resolveFrom(context)
+                                        : CupertinoColors.systemGrey5
+                                              .resolveFrom(context),
+                                    borderRadius: BorderRadius.only(
+                                      topLeft: const Radius.circular(20),
+                                      topRight: const Radius.circular(20),
+                                      bottomLeft: isMine
+                                          ? const Radius.circular(20)
+                                          : const Radius.circular(4),
+                                      bottomRight: isMine
+                                          ? const Radius.circular(4)
+                                          : const Radius.circular(20),
+                                    ),
+                                  ),
+                                  child: IntrinsicWidth(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Icon(
-                                          Icons.tag_faces_rounded,
-                                          size: 12,
-                                          color: isMine
-                                              ? CupertinoColors.white
-                                                    .withOpacity(0.7)
-                                              : CupertinoColors.secondaryLabel
-                                                    .resolveFrom(context),
-                                        ),
-                                        const SizedBox(width: 4),
-                                        Text(
-                                          m.timestamp
-                                              .toLocal()
-                                              .toString()
-                                              .substring(11, 16),
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w500,
-                                            color: isMine
-                                                ? CupertinoColors.white
-                                                      .withOpacity(0.8)
-                                                : CupertinoColors.secondaryLabel
-                                                      .resolveFrom(context),
+                                        if (m.senderJid != null || isMine)
+                                          Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 6.0,
+                                            ),
+                                            child: Text(
+                                              isMine
+                                                  ? (m.senderUser?.name ??
+                                                        m.senderUser?.email ??
+                                                        'Оператор')
+                                                  : (m.senderJid ?? 'Клиент'),
+                                              style: TextStyle(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w600,
+                                                color: isMine
+                                                    ? CupertinoColors.white
+                                                    : CupertinoColors
+                                                          .activeBlue,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
                                           ),
+                                        if (m.mediaUrl != null &&
+                                            m.mediaUrl!.isNotEmpty)
+                                          Padding(
+                                            padding: const EdgeInsets.only(
+                                              bottom: 8.0,
+                                            ),
+                                            child: _buildMediaWidget(m),
+                                          ),
+                                        if (m.content.isNotEmpty)
+                                          SelectableText(
+                                            m.content,
+                                            style: TextStyle(
+                                              fontSize: 15,
+                                              height: 1.4,
+                                              color: isMine
+                                                  ? CupertinoColors.white
+                                                  : CupertinoColors.label
+                                                        .resolveFrom(context),
+                                              fontWeight: FontWeight.w400,
+                                            ),
+                                          ),
+                                        const SizedBox(height: 6),
+                                        Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.tag_faces_rounded,
+                                              size: 12,
+                                              color: isMine
+                                                  ? CupertinoColors.white
+                                                        .withOpacity(0.7)
+                                                  : CupertinoColors
+                                                        .secondaryLabel
+                                                        .resolveFrom(context),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              m.timestamp
+                                                  .toLocal()
+                                                  .toString()
+                                                  .substring(11, 16),
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w500,
+                                                color: isMine
+                                                    ? CupertinoColors.white
+                                                          .withOpacity(0.8)
+                                                    : CupertinoColors
+                                                          .secondaryLabel
+                                                          .resolveFrom(context),
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ],
-                                    ),
-                                  ],
-                                ), // Column
-                              ), // Container
-                            ), // GestureDetector
+                                    ), // Column
+                                  ), // IntrinsicWidth
+                                ), // Container
+                              ), // GestureDetector
+                            ), // Flexible
                           ],
                         ),
                       );
@@ -1219,7 +1682,7 @@ class _MessagesPageState extends State<MessagesPage> {
               children: [
                 CupertinoButton(
                   padding: EdgeInsets.zero,
-                  onPressed: _loading ? null : _sendImage,
+                  onPressed: _sending ? null : _sendImage,
                   child: Container(
                     decoration: BoxDecoration(
                       color: CupertinoColors.activeBlue.resolveFrom(context),
@@ -1228,6 +1691,23 @@ class _MessagesPageState extends State<MessagesPage> {
                     padding: const EdgeInsets.all(12),
                     child: Icon(
                       CupertinoIcons.photo,
+                      color: CupertinoColors.white,
+                      size: 24,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: _sending ? null : _sendDocument,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: CupertinoColors.systemRed.resolveFrom(context),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    padding: const EdgeInsets.all(12),
+                    child: Icon(
+                      CupertinoIcons.doc_fill,
                       color: CupertinoColors.white,
                       size: 24,
                     ),
@@ -1338,7 +1818,7 @@ class _MessagesPageState extends State<MessagesPage> {
                 const SizedBox(width: 8),
                 CupertinoButton(
                   padding: EdgeInsets.zero,
-                  onPressed: _loading ? null : _sendText,
+                  onPressed: _sending ? null : _sendText,
                   child: Container(
                     decoration: BoxDecoration(
                       color: CupertinoColors.activeBlue.resolveFrom(context),
@@ -1386,7 +1866,91 @@ class _MessagesPageState extends State<MessagesPage> {
     if (m.type == 'audio') {
       return AudioBubble(client: widget.client, url: url);
     }
+    if (m.type == 'document') {
+      return _buildDocumentWidget(url);
+    }
     return _mediaFallback(url, m.type);
+  }
+
+  Widget _buildDocumentWidget(String url) {
+    final fileName = Uri.tryParse(url)?.pathSegments.isNotEmpty == true
+        ? Uri.parse(url).pathSegments.last
+        : 'document.pdf';
+
+    return GestureDetector(
+      onTap: () => _openDocument(url),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: CupertinoColors.systemGrey6,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: CupertinoColors.systemGrey4, width: 1),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              CupertinoIcons.doc_fill,
+              color: CupertinoColors.systemRed,
+              size: 32,
+            ),
+            const SizedBox(width: 12),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    fileName,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w500,
+                      fontSize: 14,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Нажмите для открытия',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: CupertinoColors.systemGrey,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openDocument(String url) async {
+    final uri = Uri.parse(url);
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Не удалось открыть документ'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка открытия документа: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   Widget _mediaFallback(String url, String type) {

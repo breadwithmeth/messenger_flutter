@@ -450,7 +450,16 @@ class _TicketMessagesPageState extends State<TicketMessagesPage> {
   }
 
   Widget _buildMediaContent(MessageDto msg, bool isFromMe) {
-    final mediaUrl = '${AppConfig.baseUrl}${msg.mediaUrl}';
+    // Если mediaUrl уже полный URL или начинается с /media/, используем R2
+    String mediaUrl;
+    if (msg.mediaUrl!.startsWith('http://') ||
+        msg.mediaUrl!.startsWith('https://')) {
+      mediaUrl = msg.mediaUrl!;
+    } else if (msg.mediaUrl!.startsWith('/media/')) {
+      mediaUrl = 'https://r2.drawbridge.kz${msg.mediaUrl}';
+    } else {
+      mediaUrl = '${AppConfig.baseUrl}${msg.mediaUrl}';
+    }
 
     switch (msg.type) {
       case 'image':
