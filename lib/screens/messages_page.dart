@@ -152,10 +152,19 @@ class _MessagesPageState extends State<MessagesPage> {
         return;
       }
 
-      final res = await _chats.chatMessages(widget.chatId);
+      // Используем новый API endpoint с поддержкой пагинации
+      final res = await _messages.getMessages(
+        chatId: widget.chatId,
+        limit: 100, // По умолчанию последние 100 сообщений
+      );
 
       setState(() {
-        _items = res.messages.reversed.toList();
+        final messages =
+            (res['messages'] as List?)
+                ?.map((e) => MessageDto.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            [];
+        _items = messages.reversed.toList();
         if (showLoading) _loading = false;
       });
 
